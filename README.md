@@ -37,6 +37,17 @@ Start before 6:30 AM PT (the entry window is 6:30-11:00 AM PT). Press Enter at
 the startup watchdog prompt. Exits are managed broker-side via bracket orders,
 so an open position stays protected even if the bot or its connection drops.
 
+## Telegram alerts (optional)
+
+Set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` in `.env` (see `.env.example`
+for how to get them) and the bot pushes messages to your phone for: trade
+entries, trade exits (with real P&L), safety-gate stops (daily loss limit /
+consecutive losses), errors needing attention, and a data-feed stall alert if
+no market data arrives for 3+ minutes during the session (plus a recovery
+message when it resumes). A `[STARTUP]` test message is sent when the bot
+launches — if you don't receive it, fix the token/chat ID before relying on
+alerts. Alerts are fail-safe: a Telegram outage can never interrupt trading.
+
 ## Files
 
 **The bot:**

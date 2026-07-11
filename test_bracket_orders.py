@@ -104,7 +104,7 @@ async def main():
             break
         exit_fill, close_reason, _ = await bot._check_position_closed(broker, token)
         if exit_fill is not None:
-            await bot._finalize_bracket_trade(exit_fill, close_reason)
+            await bot._finalize_bracket_trade(broker, exit_fill, close_reason)
 
     assert bot._awaiting_bracket_close is False, "should have finalized after broker close"
     last = bot.analytics.trades[-1]

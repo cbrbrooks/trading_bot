@@ -179,6 +179,66 @@ SESSION_STOP_FETCHING = time(13, 20)   # stop polling for the day a bit after fo
 WATCHDOG_TIMEOUT = 30
 BAR_GAP_WARN_SECONDS = 150       # warn if the newest bar is >2.5 min newer than the last one processed
 
+# ─── Telegram alerts ────────────────────────────────────────────────────────
+# Optional. If TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID are set in .env, the bot
+# sends push messages for important events (entry, exit, safety-gate trips, errors,
+# and a data-feed stall). If they're NOT set, everything still works — alerts are
+# simply skipped. The notifier is deliberately fail-safe: a Telegram outage or a
+# bad token can never interrupt or crash trading. Alerts are a convenience layer
+# bolted on the side, never in the critical path.
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+# Data-feed stall alert: if this many seconds pass without successfully processing a
+# NEW bar during the active session, send one "feed may be down" alert. Re-armed once
+# fresh bars resume, so a prolonged outage produces one alert (on the way down) and one
+# recovery alert — not a flood.
+FEED_STALL_ALERT_SECONDS = 180   # 3 minutes, per the requested threshold
+
+
+class TelegramNotifier:
+    """Sends push alerts to Telegram. Fail-safe by construction: every send is wrapped
+    so a network error, bad token, or Telegram outage logs a warning and returns —
+    it can never raise into the trading loop. If not configured, send() is a no-op."""
+
+    API_BASE = "https://api.telegram.org"
+
+    def __init__(self, token: str | None, chat_id: str | None):
+        self.token = token
+        self.chat_id = chat_id
+        self.enabled = bool(token and chat_id)
+        if not self.enabled:
+            log.info("Telegram alerts DISABLED (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set in .env). "
+                     "Trading is unaffected; you just won't get push messages.")
+        else:
+            log.info("Telegram alerts ENABLED.")
+
+    async def send(self, session, text: str, prefix: str = ""):
+        """Fire-and-forget alert. Never raises. `prefix` is a short tag like the emoji-free
+        label so the message is scannable on a phone lock screen."""
+        if not self.enabled:
+            return
+        msg = f"{prefix} {text}".strip()
+        try:
+            url = f"{self.API_BASE}/bot{self.token}/sendMessage"
+            async with session.post(url, json={"chat_id": self.chat_id, "text": msg},
+                                     timeout=10) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    log.warning(f"Telegram send got HTTP {resp.status}: {body[:200]} "
+                                f"(trading unaffected)")
+        except Exception as e:
+            # Deliberately swallow ALL exceptions — an alert failure must never touch trading.
+            log.warning(f"Telegram send failed ({type(e).__name__}: {e}) — trading unaffected.")
+
+    async def send_startup_test(self, session):
+        """One message at startup so you know alerts are actually working before you rely on
+        them. If you don't receive this, the token/chat_id are wrong — fix before trusting."""
+        await self.send(session,
+                        "CHOCH bot started. Alerts are working. You'll get messages for "
+                        "entries, exits, safety stops, errors, and data-feed stalls.",
+                        prefix="[STARTUP]")
+
 
 # ─── Analytics ──────────────────────────────────────────────────────────────
 class ChochAnalytics:
@@ -241,6 +301,9 @@ class ChochLiveBot:
         self._awaiting_bracket_close = False  # True while a bracket position is live and the
                                                # broker owns the exit; the loop polls for its close
         self._bracket_entry_signal = None     # the entry signal, kept for logging at broker close
+        self.notifier = TelegramNotifier(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
+        self._last_successful_bar_wall = None  # wall-clock time we last processed a NEW bar
+        self._feed_stall_alerted = False       # so a stall sends ONE alert, not a flood
         self.analytics = ChochAnalytics(ANALYTICS_PATH)
 
     # ── Auth / account / contract — same endpoints & fallback logic as
@@ -488,12 +551,13 @@ class ChochLiveBot:
             log.warning(f"Closing-order lookup failed: {e}")
         return "unknown", "Position closed (fill price unavailable)", None
 
-    async def _finalize_bracket_trade(self, exit_fill, close_reason):
+    async def _finalize_bracket_trade(self, session, exit_fill, close_reason):
         """Called once the broker has closed a bracket position. Records the trade with real
         entry/exit fills, reconciles the engine's safety-gate tracking to actual P&L, and
         clears the awaiting-close state. This is the bracket equivalent of what the old
         market-order exit path did inline — moved here because under brackets the close is a
-        broker event detected by polling, not an order the bot fires."""
+        broker event detected by polling, not an order the bot fires. `session` is the shared
+        aiohttp session, needed for Telegram alerts."""
         signal = getattr(self, "_bracket_entry_signal", None)
         entry_fill = getattr(self, "_live_entry_fill", None)
         direction = signal["direction"] if signal else (self.wrapper.engine.position or "long")
@@ -523,6 +587,23 @@ class ChochLiveBot:
                  else f"Bracket trade CLOSED by broker | {close_reason} | "
                       f"entry_fill={entry_fill} exit_fill={exit_fill} | actual P&L unavailable")
 
+        # EXIT alert — the real result, phone-scannable
+        if real_pnl is not None:
+            pnl_word = "WIN" if real_pnl > 0 else ("LOSS" if real_pnl < 0 else "SCRATCH")
+            await self.notifier.send(
+                session,
+                f"{close_reason} | {pnl_word} ${real_pnl:+,.2f}\n"
+                f"{direction.upper()} {entry_fill} -> {exit_fill}\n"
+                f"Day so far: ${eng.daily_pnl - theo_for_reconcile + real_pnl:+,.2f} "
+                f"| trades {eng.trades_today}/{MAX_TRADES_PER_DAY}",
+                prefix="[EXIT]")
+        else:
+            await self.notifier.send(
+                session,
+                f"{close_reason} — but the bot couldn't capture the real fill prices. "
+                f"Check TopstepX for the actual result.",
+                prefix="[EXIT?]")
+
         self.analytics.log_trade(
             theo_entry, direction,
             (signal.get("stop") if close_reason and "Stop" in close_reason else signal.get("target")) if signal else None,
@@ -537,6 +618,21 @@ class ChochLiveBot:
                      f"real daily P&L=${self.wrapper.engine.daily_pnl:.2f} | "
                      f"consecutive losses={self.wrapper.engine.consecutive_losses} | "
                      f"(gates: DAILY_LOSS_LIMIT=${DAILY_LOSS_LIMIT:.0f}, MAX_CONSEC_LOSSES={MAX_CONSECUTIVE_LOSSES})")
+            # SAFETY-GATE alert — the "bot has stopped itself for the day" message. Checked
+            # here, right after reconciliation, so it reflects REAL P&L, not theoretical.
+            if self.wrapper.engine.daily_pnl <= -DAILY_LOSS_LIMIT:
+                await self.notifier.send(
+                    session,
+                    f"DAILY LOSS LIMIT hit: ${self.wrapper.engine.daily_pnl:+,.2f} "
+                    f"(limit -${DAILY_LOSS_LIMIT:.0f}). No more trades today.",
+                    prefix="[SAFETY STOP]")
+            elif self.wrapper.engine.consecutive_losses >= MAX_CONSECUTIVE_LOSSES:
+                await self.notifier.send(
+                    session,
+                    f"{self.wrapper.engine.consecutive_losses} consecutive losses — "
+                    f"bot is done trading for today (real daily P&L "
+                    f"${self.wrapper.engine.daily_pnl:+,.2f}).",
+                    prefix="[SAFETY STOP]")
         else:
             log.warning("Bracket close: could not capture real fills — safety gates remain on "
                         "theoretical P&L. Watch your account directly.")
@@ -596,6 +692,8 @@ class ChochLiveBot:
             self.wrapper = CHOCHFVGReplayWrapper()
             self._last_bar_fp = None
             self._last_bar_ts = None
+            self._last_successful_bar_wall = None
+            self._feed_stall_alerted = False
             log.info(f"New trading day {today} — fresh CHOCH engine.")
 
     # ── Signal handling ──────────────────────────────────────────────────
@@ -626,12 +724,23 @@ class ChochLiveBot:
                 log.info(f"Entry #{self.wrapper.engine.trades_today} confirmed (bracket) | {signal['reason']} | "
                          f"theoretical entry={entry_theo} | actual fill={fill} | "
                          f"broker managing stop {stop_ticks}t / target {target_ticks}t")
+                await self.notifier.send(
+                    session,
+                    f"{action.upper()} {CONTRACTS} {INSTRUMENT} @ {fill}\n"
+                    f"Stop {stop_ticks}t ({stop_pts:.2f}pt) / Target {target_ticks}t ({target_pts:.2f}pt)\n"
+                    f"Broker managing both exits.",
+                    prefix="[ENTRY]")
             else:
                 self._live_entry_fill = None
                 self._awaiting_bracket_close = False
                 log.error("Bracket entry failed/unconfirmed, but the strategy engine now thinks "
                            "it's in a trade. MANUALLY CHECK YOUR ACCOUNT — engine and broker may "
                            "be out of sync.")
+                await self.notifier.send(
+                    session,
+                    "Bracket entry FAILED or unconfirmed, but the strategy thinks it's in a trade. "
+                    "CHECK YOUR ACCOUNT NOW — bot and broker may be out of sync.",
+                    prefix="[ERROR]")
 
         elif signal["type"] == "exit":
             # With brackets, the BROKER closes the position, not us. The engine still emits an
@@ -659,9 +768,15 @@ class ChochLiveBot:
             log.info(f"  Same, in Arizona local time (AZ doesn't observe DST, so this shifts "
                       f"seasonally relative to PT): Entry window: {_pt_to_az_str(SESSION_OPEN)}-"
                       f"{_pt_to_az_str(SESSION_CLOSE)} AZ | Force flat: {_pt_to_az_str(FORCE_FLAT_TIME)} AZ")
-            log.info(f"  RR={RR_MULTIPLE} | Early breakeven at {EARLY_BREAKEVEN_PCT*100:.0f}% of risk covered "
+            log.info(f"  RR={RR_MULTIPLE} | Breakeven move: {'ON' if USE_BREAKEVEN else 'OFF (pure fixed brackets)'} "
                       f"| Max stop={MAX_STOP_POINTS}pts | Max risk/trade=${MAX_TRADE_RISK_DOLLARS}")
-            log.info(f"  Contracts: {CONTRACTS}x {INSTRUMENT} | Orders: MARKET | Min stop filter: {MIN_STOP_POINTS}pts")
+            log.info(f"  Contracts: {CONTRACTS}x {INSTRUMENT} | Orders: BRACKET (broker-managed stop+target) "
+                      f"| Min stop filter: {MIN_STOP_POINTS}pts")
+
+            # Telegram startup test — if configured, you should get this message on your phone
+            # within seconds. If you don't, the token/chat_id are wrong: fix them BEFORE
+            # trusting alerts to tell you about problems.
+            await self.notifier.send_startup_test(session)
 
             # Watchdog runs ONCE, here, at startup only — no periodic re-check in the loop
             # below. This trades away the "still-watching" safety net after the initial
@@ -703,7 +818,7 @@ class ChochLiveBot:
                 if getattr(self, "_awaiting_bracket_close", False) and not DRY_RUN:
                     exit_fill, close_reason, _ = await self._check_position_closed(session, token)
                     if exit_fill is not None:
-                        await self._finalize_bracket_trade(exit_fill, close_reason)
+                        await self._finalize_bracket_trade(session, exit_fill, close_reason)
 
                 # Defense-in-depth: if we're past force-flat and the engine still
                 # thinks it's in a trade, the normal signal path should already have
@@ -721,6 +836,32 @@ class ChochLiveBot:
                 if pt_time < SESSION_OPEN or pt_time > SESSION_STOP_FETCHING:
                     await asyncio.sleep(60)
                     continue
+
+                # ── Data-feed stall detection ─────────────────────────────────
+                # If no NEW bar has been successfully processed for FEED_STALL_ALERT_SECONDS
+                # during the active session, something is wrong — connection down, API outage,
+                # or the loop stuck retrying. Send ONE alert (not a flood), then a recovery
+                # message when fresh bars resume. This covers ALL the silent-failure paths
+                # below (fetch exceptions, empty responses, endlessly-stale bars), because it
+                # keys off "when did we last actually process a new bar," not any one error.
+                if self._last_successful_bar_wall is None:
+                    # Seed the clock the moment the session goes active, so a feed that's dead
+                    # from the very first minute still trips the alert 3 minutes in.
+                    self._last_successful_bar_wall = datetime.now(PT)
+                if not self._feed_stall_alerted:
+                    stall_secs = (datetime.now(PT) - self._last_successful_bar_wall).total_seconds()
+                    if stall_secs >= FEED_STALL_ALERT_SECONDS:
+                        self._feed_stall_alerted = True
+                        in_trade_note = (" A bracket trade is OPEN — its stop/target live on the "
+                                         "exchange and remain protected even if the bot is blind."
+                                         if getattr(self, "_awaiting_bracket_close", False)
+                                         else " No trade is currently open.")
+                        log.error(f"DATA FEED STALL: no new bar processed in {stall_secs:.0f}s.")
+                        await self.notifier.send(
+                            session,
+                            f"No market data for {stall_secs/60:.0f}+ minutes — connection or "
+                            f"data-feed problem.{in_trade_note} Check the bot when you can.",
+                            prefix="[ALERT]")
 
                 # Fetch 1-min bars
                 end_b = datetime.now(CT)
@@ -771,6 +912,15 @@ class ChochLiveBot:
 
                 self._last_bar_fp = bar_fp
                 self._last_bar_ts = bar_ts
+
+                # New bar successfully processed — update the stall tracker, and if we'd
+                # previously alerted a stall, send the all-clear and re-arm for next time.
+                if self._feed_stall_alerted:
+                    self._feed_stall_alerted = False
+                    log.info("Data feed RECOVERED — fresh bars flowing again.")
+                    await self.notifier.send(session, "Data feed recovered — fresh bars flowing again.",
+                                              prefix="[OK]")
+                self._last_successful_bar_wall = datetime.now(PT)
 
                 candle = Candle.from_bar(latest_bar, bar_ts)
                 candle_pt_time = candle.ts.astimezone(PT).time()
