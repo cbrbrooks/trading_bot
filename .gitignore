@@ -1,0 +1,56 @@
+# ─── SECRETS — never commit ────────────────────────────────────────────────
+# Your TopStep username + API key live here. If this hits GitHub, anyone can
+# trade your account. Keep it local only; on any machine, fill in a fresh .env
+# from .env.example.
+.env
+_env
+*.env
+!.env.example
+
+# ─── Trading activity / account data — private and constantly changing ──────
+choch_bot.log
+bot.log
+*.log
+choch_trades.json
+trades.json
+
+# ─── Backtest / replay outputs — regenerated on demand, can be large ────────
+choch_replay_*.json
+crt_replay_*.json
+choch_batch_replay_*.json
+choch_daily_summary_*.xlsx
+choch_trade_log_*.xlsx
+
+# ─── Market data — too large for GitHub, and licensed (do not redistribute) ─
+*.zst
+*.csv
+glbx-*
+
+# ─── Python build artifacts ─────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# ─── Backup files and one-off exploratory scripts (not part of the bot) ─────
+*.bak
+realistic_fill_estimate.py
+test_limit_fill_frequency.py
+
+# ─── Virtual environments ───────────────────────────────────────────────────
+venv/
+.venv/
+env/
+ENV/
+
+# ─── OS / editor cruft ──────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp

@@ -1,0 +1,22 @@
+# CHOCH/FVG trading bot dependencies.
+# Install with:  pip install -r requirements.txt
+#
+# Versions are lower-bounds (>=) matching what the bot was developed and tested
+# against — newer patch releases are expected to work. Pin exact versions (==)
+# instead if you want fully reproducible installs across machines.
+
+# Live bot: async HTTP to the TopstepX / ProjectX Gateway API
+aiohttp>=3.14.0
+
+# Loading TOPSTEP_USERNAME / TOPSTEP_API_KEY from the .env file
+python-dotenv>=1.2.0
+
+# Strategy math (ATR, means) and data handling in the backtest replays
+numpy>=2.4.0
+pandas>=3.0.0
+
+# Decompressing the Databento .zst historical data file for backtests
+zstandard>=0.25.0
+
+# Building the .xlsx daily-summary workbooks
+openpyxl>=3.1.0
