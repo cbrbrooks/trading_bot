@@ -304,6 +304,7 @@ class ChochLiveBot:
         self.notifier = TelegramNotifier(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
         self._last_successful_bar_wall = None  # wall-clock time we last processed a NEW bar
         self._feed_stall_alerted = False       # so a stall sends ONE alert, not a flood
+        self._session_summary_sent = False     # one end-of-session summary per day
         self.analytics = ChochAnalytics(ANALYTICS_PATH)
 
     # ── Auth / account / contract — same endpoints & fallback logic as
@@ -644,6 +645,31 @@ class ChochLiveBot:
         self.wrapper.engine.in_trade = False
         self.wrapper.engine.position = None
 
+    async def _send_session_summary(self, session):
+        """One end-of-session Telegram summary. Fires at SESSION_CLOSE (11:00 AM PT) if flat,
+        or — if a trade entered before the cutoff is still running — the moment it closes.
+        Counts come from today's analytics records using the headline pnl (real fills when
+        captured), and Net uses the engine's reconciled daily_pnl, so a day like July 10
+        reports the REAL -$125, not the theoretical -$25."""
+        today_str = datetime.now(PT).strftime("%Y-%m-%d")
+        todays = [t for t in self.analytics.trades
+                  if t.get("date") == today_str and not t.get("dry_run", False)]
+        trade_count = len(todays)
+        wins = sum(1 for t in todays if (t.get("pnl") or 0) > 0)
+        losses = sum(1 for t in todays if (t.get("pnl") or 0) < 0)
+        daily_pnl = self.wrapper.engine.daily_pnl
+        await self.notifier.send(
+            session,
+            f"Session Complete\n"
+            f"Trades: {trade_count}\n"
+            f"Wins: {wins}\n"
+            f"Losses: {losses}\n"
+            f"Net: ${daily_pnl:+,.2f}",
+            prefix="[SUMMARY]")
+        log.info(f"Session summary sent | trades={trade_count} W={wins} L={losses} "
+                 f"net=${daily_pnl:+,.2f}")
+        self._session_summary_sent = True
+
     async def _flatten_all(self, session, token, reason=""):
         log.info(f"FLATTEN ALL — {reason}")
         if DRY_RUN:
@@ -694,6 +720,7 @@ class ChochLiveBot:
             self._last_bar_ts = None
             self._last_successful_bar_wall = None
             self._feed_stall_alerted = False
+            self._session_summary_sent = False
             log.info(f"New trading day {today} — fresh CHOCH engine.")
 
     # ── Signal handling ──────────────────────────────────────────────────
@@ -819,6 +846,16 @@ class ChochLiveBot:
                     exit_fill, close_reason, _ = await self._check_position_closed(session, token)
                     if exit_fill is not None:
                         await self._finalize_bracket_trade(session, exit_fill, close_reason)
+
+                # ── End-of-session summary ────────────────────────────────────
+                # Fires once per day at SESSION_CLOSE (11:00 AM PT) if flat — or, if a trade
+                # entered before the cutoff is still running, the moment it closes. Weekends
+                # never reach here (skipped above).
+                if (not self._session_summary_sent and pt_time >= SESSION_CLOSE
+                        and not self.wrapper.engine.in_trade
+                        and not getattr(self, "_awaiting_bracket_close", False)
+                        and not DRY_RUN):
+                    await self._send_session_summary(session)
 
                 # Defense-in-depth: if we're past force-flat and the engine still
                 # thinks it's in a trade, the normal signal path should already have
