@@ -109,10 +109,13 @@ async def main():
     assert bot._awaiting_bracket_close is False, "should have finalized after broker close"
     last = bot.analytics.trades[-1]
     # real P&L: entry 7606.00 -> exit 7616.50 = 10.5pt * $50 * 2 = $1050
-    assert last["actual_pnl"] == 1050.0, f"expected real P&L $1050, got {last['actual_pnl']}"
+    assert last["actual_gross_pnl"] == 1050.0, f"expected gross real P&L $1050, got {last.get('actual_gross_pnl')}"
+    assert last["fee"] == 7.56, f"expected fee $7.56 (2 contracts * $3.78), got {last.get('fee')}"
+    assert last["actual_pnl"] == 1042.44, f"expected NET real P&L $1042.44, got {last['actual_pnl']}"
     assert "Target" in last["exit_reason"], f"expected target close reason, got {last['exit_reason']}"
     print(f"  PASS: broker close finalized — reason='{last['exit_reason']}', "
-          f"real P&L=${last['actual_pnl']} (entry {last['actual_entry_price']} -> exit {last['actual_exit_price']})")
+          f"gross=${last['actual_gross_pnl']} fee=${last['fee']} NET=${last['actual_pnl']} "
+          f"(entry {last['actual_entry_price']} -> exit {last['actual_exit_price']})")
     print(f"  PASS: engine daily P&L reconciled to actual = ${eng.daily_pnl}")
     print()
     print("ALL BRACKET LIFECYCLE TESTS PASSED")

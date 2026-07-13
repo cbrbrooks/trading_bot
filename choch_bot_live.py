@@ -89,7 +89,7 @@ from choch_fvg_bot import (
     CHOCHFVGReplayWrapper, SESSION_OPEN, SESSION_CLOSE, FORCE_FLAT_TIME,
     CONTRACTS, RR_MULTIPLE, EARLY_BREAKEVEN_PCT, MAX_STOP_POINTS, MIN_STOP_POINTS,
     MAX_TRADE_RISK_DOLLARS, MAX_TRADES_PER_DAY, DAILY_LOSS_LIMIT, MAX_CONSECUTIVE_LOSSES,
-    USE_BREAKEVEN,
+    USE_BREAKEVEN, FEE_PER_ROUND_TURN,
 )
 
 # ── Bracket-order execution ─────────────────────────────────────────────────
@@ -258,20 +258,23 @@ class ChochAnalytics:
 
     def log_trade(self, entry_price: float, direction: str, exit_price: float,
                   reason: str, pnl: float, actual_entry: float = None,
-                  actual_exit: float = None, actual_pnl: float = None):
+                  actual_exit: float = None, actual_pnl: float = None,
+                  gross_actual_pnl: float = None, fee: float = None):
         record = {
             "date": datetime.now(PT).strftime("%Y-%m-%d"),
             "time_of_day": datetime.now(PT).strftime("%H:%M"),
             "direction": direction,
             "theoretical_entry_price": entry_price,
             "theoretical_exit_price": exit_price,
-            "theoretical_pnl": round(pnl, 2),
+            "theoretical_pnl_net": round(pnl, 2),
             "actual_entry_price": actual_entry,
             "actual_exit_price": actual_exit,
+            "actual_gross_pnl": round(gross_actual_pnl, 2) if gross_actual_pnl is not None else None,
+            "fee": round(fee, 2) if fee is not None else None,
             "actual_pnl": round(actual_pnl, 2) if actual_pnl is not None else None,
             "exit_reason": reason,
-            # Headline pnl/result_r use the REAL fill-based number when we have it —
-            # falls back to theoretical only if a fill price couldn't be captured.
+            # Headline pnl/result_r use the REAL fill-based NET-of-fees number when we have it —
+            # falls back to theoretical (also net) only if a fill price couldn't be captured.
             "pnl": round(actual_pnl, 2) if actual_pnl is not None else round(pnl, 2),
             "result_r": round((actual_pnl if actual_pnl is not None else pnl) / MAX_TRADE_RISK_DOLLARS, 2)
                         if MAX_TRADE_RISK_DOLLARS else None,
@@ -573,18 +576,28 @@ class ChochLiveBot:
 
         if entry_fill is not None and exit_fill not in (None, "unknown"):
             try:
-                real_pnl = ((float(exit_fill) - float(entry_fill)) if direction == "long"
-                            else (float(entry_fill) - float(exit_fill))) * POINT_VALUE * CONTRACTS
-                real_pnl = round(real_pnl, 2)
+                gross_real_pnl = ((float(exit_fill) - float(entry_fill)) if direction == "long"
+                                   else (float(entry_fill) - float(exit_fill))) * POINT_VALUE * CONTRACTS
+                gross_real_pnl = round(gross_real_pnl, 2)
+                # Fees, mirroring choch_fvg_bot.CHOCHFVGEngine._exit — real_pnl is NET of fees
+                # so daily_pnl, DAILY_LOSS_LIMIT, and everything downstream stay in sync with
+                # what the account actually sees. FEE constant lives in the strategy module.
+                fee = round(FEE_PER_ROUND_TURN * CONTRACTS, 2)
+                real_pnl = round(gross_real_pnl - fee, 2)
             except (TypeError, ValueError):
+                gross_real_pnl = None
+                fee = None
                 real_pnl = None
         else:
+            gross_real_pnl = None
+            fee = None
             real_pnl = None
 
         theo_entry = signal["entry_price"] if signal else None
         log.info(f"Bracket trade CLOSED by broker | {close_reason} | "
                  f"entry_fill={entry_fill} exit_fill={exit_fill} | "
-                 f"ACTUAL P&L=${real_pnl:.2f}" if real_pnl is not None
+                 f"gross P&L=${gross_real_pnl:.2f} fees=-${fee:.2f} | NET P&L=${real_pnl:.2f}"
+                 if real_pnl is not None
                  else f"Bracket trade CLOSED by broker | {close_reason} | "
                       f"entry_fill={entry_fill} exit_fill={exit_fill} | actual P&L unavailable")
 
@@ -593,7 +606,7 @@ class ChochLiveBot:
             pnl_word = "WIN" if real_pnl > 0 else ("LOSS" if real_pnl < 0 else "SCRATCH")
             await self.notifier.send(
                 session,
-                f"{close_reason} | {pnl_word} ${real_pnl:+,.2f}\n"
+                f"{close_reason} | {pnl_word} ${real_pnl:+,.2f} (after ${fee:.2f} fees)\n"
                 f"{direction.upper()} {entry_fill} -> {exit_fill}\n"
                 f"Day so far: ${eng.daily_pnl - theo_for_reconcile + real_pnl:+,.2f} "
                 f"| trades {eng.trades_today}/{MAX_TRADES_PER_DAY}",
@@ -610,7 +623,7 @@ class ChochLiveBot:
             (signal.get("stop") if close_reason and "Stop" in close_reason else signal.get("target")) if signal else None,
             close_reason, theoretical_pnl if theoretical_pnl is not None else 0.0,
             actual_entry=entry_fill, actual_exit=(float(exit_fill) if exit_fill not in (None, "unknown") else None),
-            actual_pnl=real_pnl,
+            actual_pnl=real_pnl, gross_actual_pnl=gross_real_pnl, fee=fee,
         )
 
         if real_pnl is not None:
@@ -657,6 +670,7 @@ class ChochLiveBot:
         trade_count = len(todays)
         wins = sum(1 for t in todays if (t.get("pnl") or 0) > 0)
         losses = sum(1 for t in todays if (t.get("pnl") or 0) < 0)
+        total_fees = sum((t.get("fee") or 0) for t in todays)
         daily_pnl = self.wrapper.engine.daily_pnl
         await self.notifier.send(
             session,
@@ -664,10 +678,11 @@ class ChochLiveBot:
             f"Trades: {trade_count}\n"
             f"Wins: {wins}\n"
             f"Losses: {losses}\n"
+            f"Fees: -${total_fees:,.2f}\n"
             f"Net: ${daily_pnl:+,.2f}",
             prefix="[SUMMARY]")
         log.info(f"Session summary sent | trades={trade_count} W={wins} L={losses} "
-                 f"net=${daily_pnl:+,.2f}")
+                 f"fees=${total_fees:.2f} net=${daily_pnl:+,.2f}")
         self._session_summary_sent = True
 
     async def _flatten_all(self, session, token, reason=""):

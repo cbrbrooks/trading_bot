@@ -129,6 +129,17 @@ DAILY_LOSS_LIMIT = 450.0     # 3x per-trade risk (3 losses = day done) at 2 cont
 ATR_MAX_THRESHOLD = 8.0      # block trades if 1-min ATR exceeds this (spec: "extreme" volatility only)
 ATR_WINDOW = 14
 
+# ── TopStep fees & commissions ─────────────────────────────────────────────
+# ES round-turn $3.78 = $1.89 in + $1.89 out, PER CONTRACT. Every trade's real
+# cost is FEE_PER_ROUND_TURN * CONTRACTS. At 2 contracts that's $7.56/trade.
+# These are treated as PART OF the trade's real P&L: _exit() subtracts them from
+# the reported pnl (headline number = net after fees), and daily_pnl / the
+# DAILY_LOSS_LIMIT gate include them too — so the safety limits stay in sync
+# with what actually happens to the account balance, not an idealized version.
+# (The engine's theoretical pnl still starts as gross for math traceability;
+# the subtraction happens once, in _exit, before booking.)
+FEE_PER_ROUND_TURN = 3.78    # per contract, ES
+
 FIB_LOW = 0.50                 # confirmed via isolated A/B test: wide zone outperforms the
 FIB_HIGH = 0.618                # narrowed 0.58-0.64 "golden pocket" test
 
@@ -364,7 +375,9 @@ def _check_exit(self: CHOCHFVGEngine, candle: Candle) -> dict | None:
 def _exit(self: CHOCHFVGEngine, exit_price: float, reason: str) -> dict:
     pnl = ((exit_price - self.entry_price) if self.position == "long"
            else (self.entry_price - exit_price)) * POINT_VALUE * CONTRACTS
-    pnl = round(pnl, 2)
+    gross_pnl = round(pnl, 2)
+    fee = round(FEE_PER_ROUND_TURN * CONTRACTS, 2)   # e.g. $7.56 at 2 ES contracts
+    pnl = round(gross_pnl - fee, 2)                    # NET of fees — the number the account actually sees
     self.daily_pnl += pnl
     self._last_theoretical_exit_pnl = pnl  # so the live bracket path can back this exact
                                             # amount out when reconciling to the real fill
@@ -373,7 +386,8 @@ def _exit(self: CHOCHFVGEngine, exit_price: float, reason: str) -> dict:
     else:
         self.consecutive_losses = 0
     result = {"type": "exit", "exit_price": exit_price, "reason": reason,
-              "pnl": pnl, "entry_price": self.entry_price, "direction": self.position}
+              "pnl": pnl, "gross_pnl": gross_pnl, "fee": fee,
+              "entry_price": self.entry_price, "direction": self.position}
     self.in_trade = False
     self.position = None
     self.entry_price = None
