@@ -746,13 +746,21 @@ class ChochLiveBot:
         if signal["type"] == "entry":
             action = "buy" if signal["direction"] == "long" else "sell"
             # Convert the engine's point-based stop/target distances to ticks for the bracket.
-            # The engine sets stop_price/target_price as absolute prices off the theoretical
-            # entry; distance in points / TICK_SIZE = ticks. Round to nearest whole tick.
+            # ROUNDING DIRECTION MATTERS: banker's-rounding (Python's round()) truncates
+            # half-values to even, which cost half a tick on target-hit trades where the
+            # target came out to *.5 ticks. Switched to explicit trade-favorable rounding:
+            # STOP uses floor() (tighter stop = smaller loss when hit),
+            # TARGET uses ceil() (farther target adds slight room = never rounds toward miss).
+            # Both are 1-tick maximum bias, but on the correct side. Also enforce the
+            # broker's 4-tick minimum on the SUBMITTED stop as a belt-and-suspenders safety
+            # check — the engine's BROKER_MIN_STOP_POINTS should already ensure this, but
+            # a bug there shouldn't produce an invalid order at the broker.
+            import math
             entry_theo = signal["entry_price"]
             stop_pts = abs(entry_theo - signal["stop"])
             target_pts = abs(signal["target"] - entry_theo)
-            stop_ticks = max(1, round(stop_pts / TICK_SIZE))
-            target_ticks = max(1, round(target_pts / TICK_SIZE))
+            stop_ticks = max(4, math.floor(stop_pts / TICK_SIZE))    # broker requires ≥4 ticks
+            target_ticks = max(1, math.ceil(target_pts / TICK_SIZE))
 
             if DRY_RUN:
                 log.info(f"[DRY RUN] Would place BRACKET {action.upper()} entry | {signal['reason']} "

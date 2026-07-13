@@ -80,6 +80,9 @@ if _max_stop_override:
 _min_stop_override = os.environ.get("CHOCH_MIN_STOP_POINTS")
 if _min_stop_override:
     choch_fvg_bot.MIN_STOP_POINTS = float(_min_stop_override)
+_broker_min_stop_override = os.environ.get("CHOCH_BROKER_MIN_STOP_POINTS")
+if _broker_min_stop_override:
+    choch_fvg_bot.BROKER_MIN_STOP_POINTS = float(_broker_min_stop_override)
 _breakeven_override = os.environ.get("CHOCH_USE_BREAKEVEN")
 if _breakeven_override is not None:
     choch_fvg_bot.USE_BREAKEVEN = _breakeven_override.lower() in ("1", "true", "yes")

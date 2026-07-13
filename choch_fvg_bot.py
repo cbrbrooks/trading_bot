@@ -60,7 +60,15 @@ import numpy as np
 from topstep_bot_v5 import Candle, POINT_VALUE
 
 SESSION_OPEN = time(6, 30)
-SESSION_CLOSE = time(11, 0)  # no NEW entries after this — widened from 10:30 to 11:00 AM PT
+SESSION_CLOSE = time(12, 30) # no NEW entries after this — extended from 11:00 to 12:30 after
+                              # a full sweep (11:00/11:30/12:00/12:30/12:45) showed 12:30 nearly
+                              # maxes out total P&L while staying comfortably ahead of the 1:10 PT
+                              # force-flat cutoff. Over the Jan 2025–Jun 2026 backtest under the
+                              # current config (BROKER_MIN_STOP_POINTS=1.0, fixed brackets, fees),
+                              # extending to 12:30 grew net P&L from $19,977 to $26,500 (+$6,523,
+                              # +33%) with the win rate essentially unchanged (40.3% → 39.9%).
+                              # 12:45 would add another ~$2,200 but pushes trade closes uncomfortably
+                              # close to the force-flat, so 12:30 was chosen as the balance point.
                               # after a finer sweep (10:30/11:00/11:30/12:00/12:30/1:10) found
                               # expectancy PER TRADE peaks right around here, not later: 10:30
                               # $54.30/trade, 11:00 $53.87/trade (essentially the same), then a
@@ -85,6 +93,36 @@ CONTRACTS = 2                 # 2 ES contracts — raised from 1 (tested via CHO
                                # MAX_TRADE_RISK_DOLLARS and DAILY_LOSS_LIMIT below are scaled
                                # 2x to match — see their comments. MAX_STOP_POINTS is NOT scaled:
                                # it's a pure point-distance filter, independent of contract count.
+BROKER_MIN_STOP_POINTS = 1.0  # TopstepX rejects bracket stops closer than 4 ticks (1.0pt on
+                               # ES) — this pads the stop out to that minimum when the setup's
+                               # own risk_points is tighter. Set to 1.0 as the default after
+                               # a live rejection on 2026-07-13 ("Invalid stop loss ticks (2).
+                               # Price should be at least 4 ticks away"), backed by an 18mo
+                               # backtest sweep: keeping all setups but widening tight stops
+                               # to 1.0 gives $19,977 over Jan 2025-Jun 2026 (40.3% WR, 390
+                               # trades) — a 15% haircut vs the invalid $23,619 baseline, but
+                               # 25× better than "just filter tight setups out" ($804 at
+                               # MIN_STOP_POINTS=1.0). Set to 0.0 to run the raw backtest
+                               # without any broker-compliance widening.
+FIXED_STOP_POINTS = 1.0       # Fixed 1.0pt stop on every trade (uniform geometry mode).
+                               # Setup selection (which trades to take) is UNCHANGED — the
+                               # pattern still identifies the same CHOCH+FVG setups; only the
+                               # stop and target become fixed distances. Every trade: stop 1.0pt
+                               # away, target RR_MULTIPLE * 1.0pt (currently 3.0pt) away.
+                               # Set to 0.0 to revert to variable-stop mode (pattern-derived
+                               # stop, BROKER_MIN_STOP_POINTS as floor).
+                               #
+                               # Chosen 2026-07-13 after backtest sweep (Jan 2025-Jun 2026):
+                               # FIXED_STOP=1.0 + RR=3 → $27,957 net, 40.8% WR, 505 trades.
+                               # Nearly identical to variable-stop config ($26,500 net, 39.9% WR),
+                               # but with much cleaner mechanics: every stop is broker-compliant
+                               # by construction, every trade has identical dollar risk/reward,
+                               # and January (the ugliest month) turns from -$104 to +$158 net
+                               # with a max loss streak of 9 instead of the higher-RR ranges of
+                               # 11-17. Trade-off: higher RRs (5-7) show larger totals in backtest
+                               # but with WR dropping to 23-30% — psychologically much harder to
+                               # trade through. RR=3 fixed matches the current strategy's feel
+                               # while getting uniform geometry.
 MAX_STOP_POINTS = 1.5         # 1R = $75/contract at ES's $50/point — the REAL quality filter,
                                # in points, independent of contract count or dollar value
 MIN_STOP_POINTS = 0.25        # Floor on risk_points, promoted to the actual default after
@@ -106,22 +144,24 @@ MAX_TRADE_RISK_DOLLARS = 150.0 # 1R at 2 contracts ($75 * CONTRACTS). Scaled wit
                                # this stays a redundant backstop consistent with MAX_STOP_POINTS
                                # (both should reject the same trades) rather than becoming a NEW,
                                # tighter, unintended filter that only 1-contract math satisfies.
-RR_MULTIPLE = 7.0            # target = entry +/- 7R. Was 3.0, then 4.0; a full sweep
-                               # (4/4.5/5/5.5/6/7/8) on the 18-month backtest found total P&L
-                               # climbing at EVERY point tested, no peak found even at 8R
-                               # ($33,975 vs $19,850 at 4R). Structural reason: EARLY_BREAKEVEN_PCT
-                               # caps a trade's downside at $0 once triggered regardless of RR, so
-                               # widening the target can only convert some winners into scratches
-                               # (opportunity cost) while trades that still reach it pay more —
-                               # not a normal risk/reward tradeoff. Checked whether FORCE_FLAT_TIME
-                               # was starting to clip trades short of increasingly distant targets
-                               # (the one real structural ceiling this architecture has) — zero
-                               # forced-flat exits at RR=7 or RR=8, so that wall hadn't been hit
-                               # yet either. 7R chosen as a judgment call, not a mathematical peak:
-                               # realism of the move required and holding-time/unrealized-swing
-                               # exposure both grow with RR in ways this backtest doesn't price in,
-                               # so stopped just below the tested ceiling (8) rather than at it.
-                               # 7R: 540 trades, 38.4% WR, $62.93/trade, $30,837.50 total/18mo.
+RR_MULTIPLE = 3.0            # target = entry +/- 3R (= 3.0pt on every trade in fixed-stop mode).
+                               # Changed 2026-07-13 from 7.0 as part of the fixed-stop switch.
+                               # Backtest sweep across RR=2/3/4/5/6/7 at FIXED_STOP=1.0:
+                               #   RR=2: $17,444, 47.3% WR, 510 trades (Jan +$950, safest month)
+                               #   RR=3: $27,957, 40.8% WR, 505 trades (Jan +$158, best balance)
+                               #   RR=4: $29,603, 33.5% WR, 499 trades (Jan -$727, WR getting rough)
+                               #   RR=5: $34,525, 29.6% WR, 496 trades (Jan -$827)
+                               #   RR=6: $36,213, 26.1% WR, 491 trades (Jan -$1,127)
+                               #   RR=7: $36,443, 23.0% WR, 487 trades (Jan -$827, streak of 17)
+                               # RR=3 chosen: nearly identical expected P&L to previous variable-
+                               # stop config ($27,957 vs $26,500), similar win rate feel (40.8% vs
+                               # 39.9%), similar $/win ($292 vs $302), but with cleaner uniform
+                               # geometry and a manageable January. Higher RRs offer more total
+                               # P&L in backtest but at 23-30% WR which is much harder to trade
+                               # through emotionally. Was 7.0 for variable-stop mode where a full
+                               # sweep found totals climbing to 8R — but that math doesn't apply
+                               # to fixed-stop mode, where higher RR just means harder-to-hit
+                               # targets on every trade.
 MAX_TRADES_PER_DAY = 3
 MAX_CONSECUTIVE_LOSSES = 2
 DAILY_LOSS_LIMIT = 450.0     # 3x per-trade risk (3 losses = day done) at 2 contracts —
@@ -321,9 +361,38 @@ class CHOCHFVGReplayWrapper:
 
             if risk_points <= 0 or risk_points > MAX_STOP_POINTS or risk_points < MIN_STOP_POINTS:
                 continue  # quality filter — applies regardless of contract count
-            total_risk = risk_points * POINT_VALUE * CONTRACTS
+
+            # FIXED_STOP_POINTS override: keep the setup, but replace its natural stop AND target
+            # with fixed distances. Same trades get taken (the setup quality filter above is
+            # unchanged), only the exit geometry changes. When 0 (default), the pattern's own
+            # risk_points drives everything downstream.
+            if FIXED_STOP_POINTS > 0:
+                risk_points = FIXED_STOP_POINTS
+                stop = entry - risk_points if fvg.type == "bullish" else entry + risk_points
+
+            # Pad the stop out to the broker's minimum bracket distance if needed. TopstepX's
+            # bracket API rejects stops closer than BROKER_MIN_STOP_POINTS ("Invalid stop loss
+            # ticks — price should be at least 4 ticks away"), which killed a live entry on
+            # 2026-07-13. The setup's ORIGINAL risk_points still drives the target math (kept
+            # unchanged from the pattern's own geometry, i.e. the 7R the strategy was designed
+            # around); we only widen the STOP for broker compliance. Effect on losing trades:
+            # a stop that would have been 0.375pt now sits at 1.0pt, so a loss that would have
+            # been -$37.50 becomes -$100. Effect on winning trades: unchanged, since the target
+            # is unchanged. Whether this trade-off wins overall depends on how often the wider
+            # stop actually gets hit — measured in the backtest at each configuration.
+            # (Skipped when FIXED_STOP_POINTS is active, since fixed mode sets both directly.)
+            if FIXED_STOP_POINTS == 0:
+                broker_stop = max(risk_points, BROKER_MIN_STOP_POINTS)
+                if broker_stop != risk_points:
+                    stop = entry - broker_stop if fvg.type == "bullish" else entry + broker_stop
+            else:
+                broker_stop = risk_points   # already fixed to a broker-compliant value
+
+            # Total-risk check runs on the ACTUAL submitted stop, not the pattern's ideal one,
+            # so a widened stop that would blow through the dollar cap is still rejected.
+            total_risk = broker_stop * POINT_VALUE * CONTRACTS
             if total_risk > MAX_TRADE_RISK_DOLLARS:
-                continue  # backstop safety check, consistent with the point filter above
+                continue  # backstop safety check
 
             direction = "long" if fvg.type == "bullish" else "short"
             target = entry + RR_MULTIPLE * risk_points if direction == "long" else entry - RR_MULTIPLE * risk_points
