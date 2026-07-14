@@ -164,7 +164,38 @@ RR_MULTIPLE = 3.0            # target = entry +/- 3R (= 3.0pt on every trade in 
                                # targets on every trade.
 MAX_TRADES_PER_DAY = 3
 MAX_CONSECUTIVE_LOSSES = 2
-DAILY_LOSS_LIMIT = 450.0     # 3x per-trade risk (3 losses = day done) at 2 contracts —
+DAILY_LOSS_LIMIT = 230.0     # Backstop. Sits just above the worst reachable day, so under the
+                               # CURRENT config it never actually fires — and that is the intent:
+                               # the consecutive-loss gate is the real protection, this is the net
+                               # beneath it.
+                               #
+                               # Why it can't fire today: in fixed-stop mode every loss is exactly
+                               # -$107.56 net (1.0pt x $50/pt x 2 contracts, + $7.56 fees), so
+                               # MAX_CONSECUTIVE_LOSSES=2 ends the day at -$215.12 — $14.88 short
+                               # of this limit. Enumerating every possible day under the gates
+                               # (MAX_TRADES_PER_DAY=3, MAX_CONSECUTIVE_LOSSES=2) yields exactly
+                               # one losing outcome:
+                               #     LL              -> -$215.12   <- true worst possible day
+                               #     WLL / LWL       ->  +$77.32
+                               #     LWW / WWL / WLW -> +$477.32
+                               #     WWW             -> +$877.32
+                               # Any day containing a single win finishes GREEN — one win (+$292.44)
+                               # covers 2.7 losses.
+                               #
+                               # NOTE ON GATE SEMANTICS: this limit is checked BEFORE opening a
+                               # trade, so it can only block the NEXT entry — it cannot prevent the
+                               # loss that breaches it. Setting it at or below $215.12 would make it
+                               # fire, but only at the exact moment MAX_CONSECUTIVE_LOSSES already
+                               # stopped the day, so it would be pure redundancy, not extra safety.
+                               #
+                               # WHY KEEP IT AT ALL: it becomes live automatically if the geometry
+                               # changes — more CONTRACTS, a wider FIXED_STOP_POINTS, or a higher
+                               # MAX_CONSECUTIVE_LOSSES all raise the reachable daily loss past this
+                               # number. Scaled with CONTRACTS by the replay harness, same as
+                               # MAX_TRADE_RISK_DOLLARS.
+                               #
+                               # REAL MAX DAILY LOSS TODAY: $215.12 (2 losses), enforced by
+                               # MAX_CONSECUTIVE_LOSSES — not by this constant.
                                # scaled with CONTRACTS/MAX_TRADE_RISK_DOLLARS for the same reason
 ATR_MAX_THRESHOLD = 8.0      # block trades if 1-min ATR exceeds this (spec: "extreme" volatility only)
 ATR_WINDOW = 14
@@ -183,6 +214,34 @@ FEE_PER_ROUND_TURN = 3.78    # per contract, ES
 FIB_LOW = 0.50                 # confirmed via isolated A/B test: wide zone outperforms the
 FIB_HIGH = 0.618                # narrowed 0.58-0.64 "golden pocket" test
 
+QUALITY_FILTERS_ENABLED = True # ENABLED 2026-07-13. Applies the SINGLE surviving filter in
+                               # choch_quality_filters.py: block entries whose FVG quality score
+                               # is < 45. In practice this rejects one specific class of setup —
+                               # a WIDE gap (>= ~1.5pt) that has gone STALE (price took >= 2
+                               # candles to return to it). Blocks ~4% of otherwise-valid setups.
+                               #
+                               # This is the only filter of five attempts that did not cost money.
+                               # Validated with a chronological 80/20 split:
+                               #   TRAIN (Jan 2025-Feb 2026): 388->373 trades, WR 36.3%->37.3%,
+                               #                              P&L $14,542 -> $15,355 (+$813).
+                               #                              Blocked group: 18 trades, 16.7% WR.
+                               #   TEST  (Mar-Jun 2026, sealed, used once): 117->115 trades,
+                               #                              WR 55.6%->56.5%, P&L $13,415 ->
+                               #                              $13,631 (+$215). Blocked group:
+                               #                              3 trades, 0% WR.
+                               #
+                               # HONEST CAVEAT: the blocked sample is only 21 trades total across
+                               # both periods (3 wins). Combined z ~ -1.9, just under the 1.96
+                               # significance bar. This is NOT statistically proven — it is weak
+                               # evidence in a consistent direction plus a sound mechanism, with
+                               # bounded downside. Expected impact ~+1-2% on P&L.
+                               #
+                               # THE TEST SET IS SPENT. Do not re-tune the 45 threshold against
+                               # this backtest. Next honest evaluation comes from LIVE trades.
+                               #
+                               # NO momentum / time / trend / market-structure filters. All four
+                               # were built, tested, and rejected — they reduced P&L.
+                               # Set False to revert to the pure unfiltered baseline.
 USE_BREAKEVEN = False         # When False, the stop stays FIXED at its original level for the
                                # entire trade — no mid-trade breakeven relocation. This matches
                                # "pure fixed brackets": on entry, a fixed stop and fixed target are
@@ -209,12 +268,15 @@ EARLY_BREAKEVEN_PCT = 0.30    # Only used when USE_BREAKEVEN is True. Replaces t
 
 
 class FVG:
-    def __init__(self, fvg_type: str, top: float, bottom: float):
+    def __init__(self, fvg_type: str, top: float, bottom: float, created_at_index: int = -1):
         self.type = fvg_type  # "bullish" | "bearish"
         self.top = top
         self.bottom = bottom
         self.midpoint = (top + bottom) / 2
         self.consumed = False
+        self.created_at_index = created_at_index  # engine candle index at creation, for
+                                                    # age-based staleness scoring in the
+                                                    # quality-filter overlay (-1 = untracked)
 
 
 class CHOCHFVGEngine:
@@ -260,10 +322,11 @@ class CHOCHFVGEngine:
             self.active_fvgs = []
 
     def _detect_fvg(self, c1: Candle, c2: Candle, c3: Candle):
+        idx = len(self.candles) - 1   # index of the newest candle (c3) at creation time
         if c1.high < c3.low:
-            self.active_fvgs.append(FVG("bullish", top=c3.low, bottom=c1.high))
+            self.active_fvgs.append(FVG("bullish", top=c3.low, bottom=c1.high, created_at_index=idx))
         elif c1.low > c3.high:
-            self.active_fvgs.append(FVG("bearish", top=c1.low, bottom=c3.high))
+            self.active_fvgs.append(FVG("bearish", top=c1.low, bottom=c3.high, created_at_index=idx))
 
     def _fib_valid(self, fvg: FVG) -> bool:
         """REAL fib alignment check — FVG midpoint vs. an EXTERNAL swing-based
@@ -335,9 +398,9 @@ class CHOCHFVGReplayWrapper:
         if eng.choch_bias is None:
             return None
 
-        return self._check_entry(eng, candle)
+        return self._check_entry(eng, candle, pt_time)
 
-    def _check_entry(self, eng: CHOCHFVGEngine, curr: Candle) -> dict | None:
+    def _check_entry(self, eng: CHOCHFVGEngine, curr: Candle, pt_time: time) -> dict | None:
         for fvg in eng.active_fvgs:
             if fvg.consumed:
                 continue
@@ -351,6 +414,20 @@ class CHOCHFVGReplayWrapper:
                 continue
 
             fvg.consumed = True
+
+            # Quality-filter overlay (optional) — four-filter scoring system. Runs after the
+            # pattern's own hard gates so it only ever REMOVES trades. The FVG is consumed
+            # either way (one shot per FVG), matching how the risk_points filter below already
+            # behaves for setups it rejects.
+            if QUALITY_FILTERS_ENABLED:
+                from choch_quality_filters import evaluate_entry_quality
+                fvg_age = (len(eng.candles) - 1 - fvg.created_at_index) if fvg.created_at_index >= 0 else 0
+                allowed, q_score, q_detail = evaluate_entry_quality(
+                    eng.candles, eng.choch_bias, eng.choch_swing_high, eng.choch_swing_low,
+                    fvg.top - fvg.bottom, fvg_age, pt_time)
+                if not allowed:
+                    continue  # quality-blocked; try any other active FVG
+
             entry = fvg.midpoint
             if fvg.type == "bullish":
                 stop = fvg.bottom

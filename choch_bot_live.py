@@ -486,7 +486,7 @@ class ChochLiveBot:
         data = await resp.json()
         if not data.get("success"):
             log.error(f"Bracket entry rejected | HTTP {resp.status} | request={order_payload} | response={data}")
-            return None, None
+            return None, None, "rejected"
         oid = data.get("orderId")
         log.info(f"Bracket entry submitted: MARKET {action.upper()} {CONTRACTS}x {INSTRUMENT} "
                   f"| stop={stop_ticks}t / target={target_ticks}t | id={oid}")
@@ -496,10 +496,10 @@ class ChochLiveBot:
             status, fill = await self._check_order_status(session, token, oid)
             if status == "filled":
                 log.info(f"Bracket entry FILLED @ {fill} | id={oid} | broker now managing stop+target")
-                return oid, fill
+                return oid, fill, "filled"
             elif status == "rejected":
                 log.error(f"Bracket entry NOT filled (rejected) | id={oid}")
-                return None, None
+                return None, None, "rejected"
         try:
             pos_resp = await session.post(f"{BASE_URL}/Position/searchOpen",
                                            headers={"Authorization": f"Bearer {token}"},
@@ -511,12 +511,16 @@ class ChochLiveBot:
                 fill = match.get("averagePrice")
                 log.warning(f"Bracket entry fill inconclusive but position CONFIRMED open "
                             f"@ {fill} — proceeding, broker managing exits.")
-                return oid, fill
+                return oid, fill, "filled"
         except Exception as e:
             log.error(f"Bracket entry position fallback failed: {e}")
+        # Neither confirmed-filled nor confirmed-rejected. A position MIGHT be open. Returning
+        # "unconfirmed" (not "rejected") so the caller does NOT roll the engine back — rolling
+        # back while a real position is live would leave the bot blind to an open trade, which
+        # is far more dangerous than a stuck in_trade flag.
         log.error("Bracket entry fill UNCONFIRMED. MANUALLY CHECK ACCOUNT — a bracket order may "
                    "be resting with no confirmed position.")
-        return None, None
+        return None, None, "unconfirmed"
 
     async def _check_position_closed(self, session, token):
         """With brackets, the BROKER closes the position when stop or target hits — the bot
@@ -766,7 +770,7 @@ class ChochLiveBot:
                 log.info(f"[DRY RUN] Would place BRACKET {action.upper()} entry | {signal['reason']} "
                          f"| stop={stop_ticks}t ({stop_pts:.2f}pt) / target={target_ticks}t ({target_pts:.2f}pt)")
                 return
-            oid, fill = await self._place_bracket_entry(session, token, action, stop_ticks, target_ticks)
+            oid, fill, status = await self._place_bracket_entry(session, token, action, stop_ticks, target_ticks)
             if oid:
                 self._live_entry_fill = fill
                 self._awaiting_bracket_close = True   # broker now owns the exit; loop will detect close
@@ -780,16 +784,54 @@ class ChochLiveBot:
                     f"Stop {stop_ticks}t ({stop_pts:.2f}pt) / Target {target_ticks}t ({target_pts:.2f}pt)\n"
                     f"Broker managing both exits.",
                     prefix="[ENTRY]")
-            else:
+
+            elif status == "rejected":
+                # CONFIRMED rejection: the broker refused the order, so NO position exists.
+                # Roll the ENGINE back. When _check_entry() produced this signal it already
+                # committed engine state (in_trade=True, trades_today+=1, position/stop/target
+                # set) assuming the order would go through. Without this rollback the engine
+                # believes it is managing a PHANTOM trade. Observed live on 2026-07-13: after a
+                # rejected entry at 08:05, the engine "exited" the nonexistent trade at 08:06 and
+                # booked $167.44 of fictional P&L into daily_pnl. Worse, while in_trade is stuck
+                # True, add_candle() routes every candle to _check_exit() instead of
+                # _check_entry(), so THE BOT SILENTLY STOPS TAKING NEW TRADES for the rest of the
+                # session, and fake P&L can trip the real safety gates.
                 self._live_entry_fill = None
                 self._awaiting_bracket_close = False
-                log.error("Bracket entry failed/unconfirmed, but the strategy engine now thinks "
-                           "it's in a trade. MANUALLY CHECK YOUR ACCOUNT — engine and broker may "
-                           "be out of sync.")
+                self._bracket_entry_signal = None
+                eng = self.wrapper.engine
+                eng.in_trade = False
+                eng.position = None
+                eng.entry_price = None
+                eng.stop_price = None
+                eng.target_price = None
+                eng.breakeven_trigger = None
+                eng.breakeven_done = False
+                eng.trades_today = max(0, eng.trades_today - 1)   # give the slot back
+                eng._last_theoretical_exit_pnl = 0.0
+                log.error("Bracket entry REJECTED by broker — engine state rolled back "
+                           "(in_trade=False, trades_today restored). No position was opened. "
+                           "The bot will continue looking for new setups.")
                 await self.notifier.send(
                     session,
-                    "Bracket entry FAILED or unconfirmed, but the strategy thinks it's in a trade. "
-                    "CHECK YOUR ACCOUNT NOW — bot and broker may be out of sync.",
+                    "Bracket entry was REJECTED by the broker — no position opened. The bot has "
+                    "reset itself and will keep looking for setups. Check the log for why.",
+                    prefix="[ERROR]")
+
+            else:
+                # UNCONFIRMED: we could not establish whether a position opened. Do NOT roll the
+                # engine back — if a position IS live, a rollback would leave the bot blind to it
+                # (no exit management, no reconciliation), which is far more dangerous than a
+                # stuck in_trade flag. Hold state, stop trading, and escalate to the human.
+                self._live_entry_fill = None
+                self._awaiting_bracket_close = False
+                log.error("Bracket entry UNCONFIRMED — cannot tell if a position opened. Engine "
+                           "state deliberately NOT rolled back (a live position must not be "
+                           "orphaned). MANUALLY CHECK YOUR ACCOUNT NOW.")
+                await self.notifier.send(
+                    session,
+                    "Bracket entry UNCONFIRMED — the bot cannot tell whether a position opened. "
+                    "CHECK YOUR ACCOUNT NOW. The bot has stopped and is not managing this trade.",
                     prefix="[ERROR]")
 
         elif signal["type"] == "exit":
