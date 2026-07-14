@@ -470,8 +470,31 @@ class ChochLiveBot:
         and take-profit bracket (type 1 = Limit). The exchange manages both exits from
         the moment of fill — this is the whole point of the bracket rewrite. Returns
         (order_id, fill_price) for the ENTRY. stop_ticks/target_ticks are distances from
-        the fill, in ticks, as the API expects (not absolute prices)."""
+        the fill, in ticks, as the API expects (not absolute prices).
+
+        SIGNED TICKS: TopstepX signs bracket ticks by which way price MOVES from entry, not
+        by profit/loss. Long -> stop negative (below), target positive (above). Short -> stop
+        positive (above), target negative (below). See _handle_signal for the live-rejection
+        evidence behind this."""
         side = 0 if action == "buy" else 1
+
+        # Belt-and-suspenders validation before anything hits the wire.
+        #  - Magnitude: broker requires the stop to sit at least 4 ticks from entry.
+        #  - Sign: stop and target must point OPPOSITE ways (one above entry, one below).
+        #    If they ever share a sign the geometry is broken and we must not submit.
+        if abs(stop_ticks) < 4:
+            log.error(f"REFUSING to submit: stop magnitude {abs(stop_ticks)} < 4 ticks (broker minimum).")
+            return None, None, "rejected"
+        if (stop_ticks > 0) == (target_ticks > 0):
+            log.error(f"REFUSING to submit: stop({stop_ticks}) and target({target_ticks}) share a sign. "
+                       f"One must be above entry and the other below — geometry is broken.")
+            return None, None, "rejected"
+        expected_stop_sign = -1 if side == 0 else +1
+        if (stop_ticks > 0) != (expected_stop_sign > 0):
+            log.error(f"REFUSING to submit: {action} order but stop_ticks={stop_ticks} has the wrong sign. "
+                       f"Long stops must be NEGATIVE, short stops POSITIVE.")
+            return None, None, "rejected"
+
         order_payload = {
             "accountId": self.account_id, "contractId": self.contract_id,
             "type": ORDER_TYPE_MARKET, "side": side, "size": CONTRACTS,
@@ -763,8 +786,30 @@ class ChochLiveBot:
             entry_theo = signal["entry_price"]
             stop_pts = abs(entry_theo - signal["stop"])
             target_pts = abs(signal["target"] - entry_theo)
-            stop_ticks = max(4, math.floor(stop_pts / TICK_SIZE))    # broker requires ≥4 ticks
-            target_ticks = max(1, math.ceil(target_pts / TICK_SIZE))
+            stop_mag = max(4, math.floor(stop_pts / TICK_SIZE))    # broker requires >= 4 ticks
+            target_mag = max(1, math.ceil(target_pts / TICK_SIZE))
+
+            # SIGN CONVENTION — TopstepX bracket ticks are SIGNED OFFSETS FROM THE ENTRY PRICE,
+            # signed by which way price has to MOVE, not by whether the leg is a profit or a
+            # loss. Learned from two live rejections:
+            #   2026-07-14: short with takeProfitBracket {ticks: +12} ->
+            #       "Invalid take profit ticks (12). Ticks should be less than zero when going short."
+            #   2026-07-13: short with stopLossBracket {ticks: +2} ->
+            #       "Invalid stop loss ticks (2). Price should be at least 4 ticks away."
+            #       (complained about MAGNITUDE only, not sign -> a POSITIVE stop tick on a
+            #        short is sign-correct)
+            # Therefore:
+            #   SHORT (side 1): stop is ABOVE entry -> POSITIVE.  target is BELOW entry -> NEGATIVE.
+            #   LONG  (side 0): stop is BELOW entry -> NEGATIVE.  target is ABOVE entry -> POSITIVE.
+            # NOTE: the LONG path has never been exercised live — every rejection so far has been
+            # a short. The long signs are the mirror of the confirmed short convention, which is
+            # the only self-consistent reading, but they remain UNVERIFIED against the broker.
+            if signal["direction"] == "long":
+                stop_ticks = -stop_mag
+                target_ticks = +target_mag
+            else:
+                stop_ticks = +stop_mag
+                target_ticks = -target_mag
 
             if DRY_RUN:
                 log.info(f"[DRY RUN] Would place BRACKET {action.upper()} entry | {signal['reason']} "

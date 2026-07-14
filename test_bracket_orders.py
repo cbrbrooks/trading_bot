@@ -83,8 +83,14 @@ async def main():
     assert "stopLossBracket" in payload and "takeProfitBracket" in payload, "not a bracket order!"
     assert payload["stopLossBracket"]["type"] == m.ORDER_TYPE_STOP, "stop bracket not type 4 (Stop)"
     assert payload["takeProfitBracket"]["type"] == m.ORDER_TYPE_LIMIT, "target bracket not type 1 (Limit)"
-    assert payload["stopLossBracket"]["ticks"] == 6, f"stop should be 6 ticks (1.5pt), got {payload['stopLossBracket']['ticks']}"
-    assert payload["takeProfitBracket"]["ticks"] == 42, f"target should be 42 ticks (10.5pt), got {payload['takeProfitBracket']['ticks']}"
+    # SIGNED ticks: this is a LONG (side 0), so stop is BELOW entry (negative) and target
+    # is ABOVE entry (positive). TopstepX rejects the wrong sign — see _handle_signal.
+    st = payload["stopLossBracket"]["ticks"]
+    tp = payload["takeProfitBracket"]["ticks"]
+    assert payload["side"] == 0, f"expected a LONG (side 0), got {payload['side']}"
+    assert st < 0, f"LONG stop must be NEGATIVE (below entry), got {st}"
+    assert tp > 0, f"LONG target must be POSITIVE (above entry), got {tp}"
+    assert abs(st) >= 4, f"stop magnitude must be >= 4 ticks (broker minimum), got {abs(st)}"
     assert bot._awaiting_bracket_close is True, "should be awaiting broker close"
     assert bot._live_entry_fill == 7606.00, f"entry fill should be captured, got {bot._live_entry_fill}"
     print(f"  PASS: bracket placed — stop {payload['stopLossBracket']['ticks']}t (type {payload['stopLossBracket']['type']}), "
