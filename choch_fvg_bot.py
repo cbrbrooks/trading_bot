@@ -58,6 +58,24 @@ from datetime import time
 import numpy as np
 
 from topstep_bot_v5 import Candle, POINT_VALUE
+# NOTE: htf_bias (MultiTimeframeBias) is imported LAZILY inside CHOCHFVGReplayWrapper.__init__
+# only when HTF_BIAS_MODE != "off". That filter tested poorly (-85% to -96% P&L) and is off by
+# default, so the deployed bot does not need htf_bias.py present at all. Keeping the import lazy
+# means the live bot runs with one fewer file to sync; htf_bias.py is only required if someone
+# deliberately re-enables the experiment.
+
+# ── Higher-timeframe structural bias filter ────────────────────────────────
+# "off" | "15m" | "30m" | "hybrid"
+# Only take 1-minute CHOCH+FVG entries that ALIGN with higher-timeframe structural
+# bias (determined via CHOCH/BOS on that timeframe — see htf_bias.py). A NEUTRAL
+# higher-timeframe bias means NO trade. "hybrid" requires 15m AND 30m to agree.
+# Default "off" — this is a test harness, not yet a deployed feature.
+HTF_BIAS_MODE = "off"
+
+# ── Breakaway FVG filter (Arjo method) ─────────────────────────────────────
+# When True, only take entries where the FVG is classified BREAKAWAY: candle 3
+# closed beyond candle 2's high (bullish) / low (bearish). Default False (test only).
+BREAKAWAY_ONLY = False
 
 SESSION_OPEN = time(6, 30)
 SESSION_CLOSE = time(12, 30) # no NEW entries after this — extended from 11:00 to 12:30 after
@@ -93,7 +111,7 @@ CONTRACTS = 2                 # 2 ES contracts — raised from 1 (tested via CHO
                                # MAX_TRADE_RISK_DOLLARS and DAILY_LOSS_LIMIT below are scaled
                                # 2x to match — see their comments. MAX_STOP_POINTS is NOT scaled:
                                # it's a pure point-distance filter, independent of contract count.
-BROKER_MIN_STOP_POINTS = 1.0  # TopstepX rejects bracket stops closer than 4 ticks (1.0pt on
+BROKER_MIN_STOP_POINTS = 1.0  # TopstepX API accepts bracket stops >= 4 ticks (1.0pt). Confirmed
                                # ES) — this pads the stop out to that minimum when the setup's
                                # own risk_points is tighter. Set to 1.0 as the default after
                                # a live rejection on 2026-07-13 ("Invalid stop loss ticks (2).
@@ -105,6 +123,14 @@ BROKER_MIN_STOP_POINTS = 1.0  # TopstepX rejects bracket stops closer than 4 tic
                                # MIN_STOP_POINTS=1.0). Set to 0.0 to run the raw backtest
                                # without any broker-compliance widening.
 FIXED_STOP_POINTS = 1.0       # Fixed 1.0pt stop on every trade (uniform geometry mode).
+                               # CONFIRMED 2026-07-14 via a live API test (test_bracket_ticks_live.py):
+                               # a bracket order with stopLossBracket ticks=4 was ACCEPTED by the
+                               # TopstepX API (orderId 3270048512, success=True). The ">5 ticks"
+                               # rule in TopStep's help docs applies to the PLATFORM UI bracket
+                               # settings, NOT to the API — the API enforces only the documented
+                               # 4-tick minimum. So a 1.0pt stop (= 4 ticks) is valid via the API,
+                               # and this is the strategy's validated geometry. Target scales via
+                               # RR_MULTIPLE (1.0 * 3.0 = 3.0pt = 12 ticks), keeping the 3:1.
                                # Setup selection (which trades to take) is UNCHANGED — the
                                # pattern still identifies the same CHOCH+FVG setups; only the
                                # stop and target become fixed distances. Every trade: stop 1.0pt
@@ -140,7 +166,12 @@ MIN_STOP_POINTS = 0.25        # Floor on risk_points, promoted to the actual def
                                # level after the signal, which turned out to correlate with
                                # LOSING trades, not fast ones (61 of 77 filtered trades in that
                                # test were winners) — a much worse selection bias than this.
-MAX_TRADE_RISK_DOLLARS = 150.0 # 1R at 2 contracts ($75 * CONTRACTS). Scaled with CONTRACTS so
+MAX_TRADE_RISK_DOLLARS = 110.0 # Backstop cap on per-trade dollar risk (stop distance only, no
+                               # fees; guard is `>`). At 1.0pt x $50 x 2 contracts the raw risk is
+                               # exactly $100, so this sits $10 ABOVE it: never blocks a normal
+                               # trade, but still rejects any genuinely wider stop. Deliberately NOT
+                               # set to 100 — that would sit exactly on the value and a single extra
+                               # rounding tick (1.01pt -> $101 > $100) would silently skip every trade.
                                # this stays a redundant backstop consistent with MAX_STOP_POINTS
                                # (both should reject the same trades) rather than becoming a NEW,
                                # tighter, unintended filter that only 1-contract math satisfies.
@@ -178,7 +209,7 @@ DAILY_LOSS_LIMIT = 230.0     # Backstop. Sits just above the worst reachable day
                                #     LL              -> -$215.12   <- true worst possible day
                                #     WLL / LWL       ->  +$77.32
                                #     LWW / WWL / WLW -> +$477.32
-                               #     WWW             -> +$877.32
+                               #     WWW            -> +$877.32
                                # Any day containing a single win finishes GREEN — one win (+$292.44)
                                # covers 2.7 losses.
                                #
@@ -196,7 +227,6 @@ DAILY_LOSS_LIMIT = 230.0     # Backstop. Sits just above the worst reachable day
                                #
                                # REAL MAX DAILY LOSS TODAY: $215.12 (2 losses), enforced by
                                # MAX_CONSECUTIVE_LOSSES — not by this constant.
-                               # scaled with CONTRACTS/MAX_TRADE_RISK_DOLLARS for the same reason
 ATR_MAX_THRESHOLD = 8.0      # block trades if 1-min ATR exceeds this (spec: "extreme" volatility only)
 ATR_WINDOW = 14
 
@@ -268,7 +298,8 @@ EARLY_BREAKEVEN_PCT = 0.30    # Only used when USE_BREAKEVEN is True. Replaces t
 
 
 class FVG:
-    def __init__(self, fvg_type: str, top: float, bottom: float, created_at_index: int = -1):
+    def __init__(self, fvg_type: str, top: float, bottom: float, created_at_index: int = -1,
+                 breakaway: bool = False):
         self.type = fvg_type  # "bullish" | "bearish"
         self.top = top
         self.bottom = bottom
@@ -277,6 +308,8 @@ class FVG:
         self.created_at_index = created_at_index  # engine candle index at creation, for
                                                     # age-based staleness scoring in the
                                                     # quality-filter overlay (-1 = untracked)
+        self.breakaway = breakaway   # Arjo classification: candle 3 closed beyond candle 2's
+                                      # high (bullish) / low (bearish). See _detect_fvg.
 
 
 class CHOCHFVGEngine:
@@ -324,9 +357,19 @@ class CHOCHFVGEngine:
     def _detect_fvg(self, c1: Candle, c2: Candle, c3: Candle):
         idx = len(self.candles) - 1   # index of the newest candle (c3) at creation time
         if c1.high < c3.low:
-            self.active_fvgs.append(FVG("bullish", top=c3.low, bottom=c1.high, created_at_index=idx))
+            # Arjo Breakaway test (bullish): does candle 3 CLOSE above candle 2's HIGH?
+            # If yes, the gap is a "Breakaway" — the move is decisive and price is (per the
+            # method) less likely to return. Measured on ES over 18 months: Breakaway gaps
+            # are mitigated 85.2% of the time vs 92.6% for Regular gaps (z=-21.4), so the
+            # classification is directionally real, though the "won't return" framing is
+            # much too strong — 85% of them do return.
+            breakaway = c3.close > c2.high
+            self.active_fvgs.append(FVG("bullish", top=c3.low, bottom=c1.high,
+                                         created_at_index=idx, breakaway=breakaway))
         elif c1.low > c3.high:
-            self.active_fvgs.append(FVG("bearish", top=c1.low, bottom=c3.high, created_at_index=idx))
+            breakaway = c3.close < c2.low   # bearish mirror
+            self.active_fvgs.append(FVG("bearish", top=c1.low, bottom=c3.high,
+                                         created_at_index=idx, breakaway=breakaway))
 
     def _fib_valid(self, fvg: FVG) -> bool:
         """REAL fib alignment check — FVG midpoint vs. an EXTERNAL swing-based
@@ -357,11 +400,29 @@ class CHOCHFVGReplayWrapper:
     bare engine needs (kept separate so the core engine stays testable
     without datetime/timezone plumbing baked in)."""
 
-    def __init__(self):
+    def __init__(self, htf_mode: str = None):
         self.engine = CHOCHFVGEngine()
+        # Higher-timeframe structural bias tracker. Feeds on EVERY 1m candle (including
+        # pre-session warmup bars) so that by the 6:30 AM session open the 15m/30m bias is
+        # already established from the overnight/premarket structure. If it only saw
+        # session candles, bias would be "neutral" for the first hour+ and — since neutral
+        # means no-trade — the filter would silently suppress all early-session entries for
+        # reasons that have nothing to do with structure.
+        mode = htf_mode if htf_mode is not None else HTF_BIAS_MODE
+        if mode != "off":
+            from htf_bias import MultiTimeframeBias  # lazy: only needed when the filter is on
+            self.htf = MultiTimeframeBias(mode)
+        else:
+            self.htf = None
 
     def add_candle(self, candle: Candle, pt_time: time, is_last_candle_of_session: bool) -> dict | None:
         eng = self.engine
+
+        # Feed the HTF tracker FIRST and unconditionally — before any session/gate checks —
+        # so higher-timeframe structure is built from the full candle stream.
+        if self.htf is not None:
+            self.htf.add_1m_candle(candle)
+
         eng.candles.append(candle)
         eng._update_atr()
 
@@ -414,6 +475,21 @@ class CHOCHFVGReplayWrapper:
                 continue
 
             fvg.consumed = True
+
+            # Breakaway FVG filter (Arjo method) — only take gaps where candle 3 closed
+            # decisively beyond candle 2. Checked after the pattern's own hard gates so it
+            # only ever REMOVES trades.
+            if BREAKAWAY_ONLY and not fvg.breakaway:
+                continue
+
+            # Higher-timeframe STRUCTURAL bias gate. The 1m setup's direction must align with
+            # the 15m/30m structural bias (established via CHOCH/BOS on that timeframe, not
+            # SMA slope). A neutral HTF bias means no trade, per spec. This is checked here —
+            # after the pattern's own hard gates — so it only ever REMOVES trades.
+            if self.htf is not None:
+                allowed_htf, htf_reason = self.htf.allows(fvg.type)
+                if not allowed_htf:
+                    continue  # HTF-blocked; try any other active FVG
 
             # Quality-filter overlay (optional) — four-filter scoring system. Runs after the
             # pattern's own hard gates so it only ever REMOVES trades. The FVG is consumed

@@ -582,13 +582,14 @@ class ChochLiveBot:
             log.warning(f"Closing-order lookup failed: {e}")
         return "unknown", "Position closed (fill price unavailable)", None
 
-    async def _finalize_bracket_trade(self, session, exit_fill, close_reason):
+    async def _finalize_bracket_trade(self, session, token, exit_fill, close_reason):
         """Called once the broker has closed a bracket position. Records the trade with real
         entry/exit fills, reconciles the engine's safety-gate tracking to actual P&L, and
         clears the awaiting-close state. This is the bracket equivalent of what the old
         market-order exit path did inline — moved here because under brackets the close is a
-        broker event detected by polling, not an order the bot fires. `session` is the shared
-        aiohttp session, needed for Telegram alerts."""
+        broker event detected by polling, not an order the bot fires. `session`/`token` are the
+        shared aiohttp session and auth token, needed for Telegram alerts and the post-close
+        order sweep."""
         signal = getattr(self, "_bracket_entry_signal", None)
         entry_fill = getattr(self, "_live_entry_fill", None)
         direction = signal["direction"] if signal else (self.wrapper.engine.position or "long")
@@ -677,6 +678,36 @@ class ChochLiveBot:
         else:
             log.warning("Bracket close: could not capture real fills — safety gates remain on "
                         "theoretical P&L. Watch your account directly.")
+
+        # BELT-AND-SUSPENDERS OCO SAFETY: cancel any order still WORKING on our contract.
+        # With Auto-OCO enabled, TopstepX cancels the sibling leg automatically when the
+        # stop or target fills, so normally there is nothing left to cancel and this is a
+        # harmless no-op. But if OCO ever fails to fire (or the position was closed some
+        # other way), a surviving stop/target leg would sit working with no position behind
+        # it — and when it later fills it OPENS A BRAND-NEW POSITION IN THE OPPOSITE
+        # DIRECTION. That is the single most dangerous leftover state on a funded account,
+        # so the bot explicitly sweeps for it rather than trusting OCO alone.
+        try:
+            start_ts = (datetime.now(CT) - timedelta(minutes=30)).isoformat()
+            r = await session.post(f"{BASE_URL}/Order/search",
+                                    headers={"Authorization": f"Bearer {token}"},
+                                    json={"accountId": self.account_id, "startTimestamp": start_ts})
+            orders = (await r.json()).get("orders", [])
+            survivors = [o for o in orders
+                         if o.get("contractId") == self.contract_id and o.get("status") == 1]
+            for o in survivors:
+                await self._cancel_order(session, token, o.get("id"))
+                log.warning(f"Swept a surviving working order {o.get('id')} after bracket close "
+                            f"(OCO should have cancelled it — cancelling to be safe).")
+            if survivors:
+                await self.notifier.send(
+                    session,
+                    f"Cancelled {len(survivors)} leftover working order(s) after the trade closed, "
+                    f"so no stray stop/target can re-open a position. You are flat.",
+                    prefix="[OK]")
+        except Exception as e:
+            log.error(f"Post-close order sweep failed: {e} — CHECK YOUR ACCOUNT for a stray "
+                       f"working order that could re-open a position.")
 
         # Clear engine + bracket state so the day can continue (up to MAX_TRADES_PER_DAY).
         self._awaiting_bracket_close = False
@@ -955,7 +986,7 @@ class ChochLiveBot:
                 if getattr(self, "_awaiting_bracket_close", False) and not DRY_RUN:
                     exit_fill, close_reason, _ = await self._check_position_closed(session, token)
                     if exit_fill is not None:
-                        await self._finalize_bracket_trade(session, exit_fill, close_reason)
+                        await self._finalize_bracket_trade(session, token, exit_fill, close_reason)
 
                 # ── End-of-session summary ────────────────────────────────────
                 # Fires once per day at SESSION_CLOSE (11:00 AM PT) if flat — or, if a trade
