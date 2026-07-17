@@ -85,6 +85,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from topstep_bot_v5 import Candle, PT, CT, BASE_URL, USERNAME, API_KEY, MES_SYMBOL, INSTRUMENT, POINT_VALUE
+import choch_fvg_bot
 from choch_fvg_bot import (
     CHOCHFVGReplayWrapper, SESSION_OPEN, SESSION_CLOSE, FORCE_FLAT_TIME,
     CONTRACTS, RR_MULTIPLE, EARLY_BREAKEVEN_PCT, MAX_STOP_POINTS, MIN_STOP_POINTS,
@@ -308,7 +309,103 @@ class ChochLiveBot:
         self._last_successful_bar_wall = None  # wall-clock time we last processed a NEW bar
         self._feed_stall_alerted = False       # so a stall sends ONE alert, not a flood
         self._session_summary_sent = False     # one end-of-session summary per day
+        # Session-anchored VWAP, computed live. CME session opens 5pm CT / 3pm PT the
+        # prior day; VWAP accumulates from there. We reset the accumulator when we cross
+        # a new session boundary (any bar at/after 3pm PT starts a fresh session that
+        # runs to 3pm PT the next day). Fed into add_candle so the VWAP/9-SMA filter uses
+        # the SAME session VWAP the backtest and the user's TradingView chart use.
+        self._vwap_pv = 0.0
+        self._vwap_vol = 0.0
+        self._vwap_session_date = None   # the "session day" the accumulator belongs to
         self.analytics = ChochAnalytics(ANALYTICS_PATH)
+
+    async def _warmup_session_vwap(self, session, token):
+        """Backfill the session-VWAP accumulator from the CME session open (3pm PT prior
+        day) to now, so VWAP is correct from the bot's first live bar rather than starting
+        mid-session. Called once per session, the first time we process a bar for it.
+
+        Without this, the accumulator would start from whenever the bot launched (often
+        6:30am PT), missing ~15.5h of overnight session volume and giving a VWAP that
+        disagrees with the backtest and the user's chart. The filter would then behave
+        differently live than tested — so this warmup is REQUIRED for the filter to be
+        trustworthy live, not a nicety."""
+        now_ct = datetime.now(CT)
+        now_pt = now_ct.astimezone(PT)
+        # End the warmup window one minute before now: the live loop will add the current
+        # (newest) bar via _update_session_vwap, so seeding up to now would double-count it.
+        warmup_end_ct = now_ct - timedelta(minutes=1)
+        session_open_pt = now_pt.replace(hour=15, minute=0, second=0, microsecond=0)
+        if now_pt.time() < time(15, 0):
+            session_open_pt = session_open_pt - timedelta(days=1)
+        start_ct = session_open_pt.astimezone(CT)
+        try:
+            resp = await session.post(
+                f"{BASE_URL}/History/retrieveBars",
+                headers={"Authorization": f"Bearer {token}"},
+                json={"contractId": self.contract_id, "live": False,
+                      "unit": 2, "unitNumber": 1, "limit": 2000,
+                      "includePartialBar": False,
+                      "startTime": start_ct.isoformat(), "endTime": warmup_end_ct.isoformat()},
+            )
+            data = await resp.json()
+            bars = data.get("bars") or data.get("d") or data.get("data") or []
+        except Exception as e:
+            log.warning(f"VWAP warmup fetch failed ({type(e).__name__}: {e}) — VWAP will "
+                        f"accumulate from the first live bar instead. Filter may be slightly "
+                        f"off until the session builds.")
+            return
+        self._vwap_pv = 0.0
+        self._vwap_vol = 0.0
+        self._vwap_session_date = self._session_day_of(now_pt)
+        n = 0
+        for b in bars:
+            try:
+                ts = b.get("t") or b.get("timestamp") or b.get("time")
+                bar_ts = datetime.fromisoformat(ts.replace("Z", "+00:00")) if isinstance(ts, str) else None
+                c = Candle.from_bar(b, bar_ts) if bar_ts else None
+                if c is None:
+                    continue
+                typical = (c.high + c.low + c.close) / 3.0
+                vol = c.volume if c.volume and c.volume > 0 else 1.0
+                self._vwap_pv += typical * vol
+                self._vwap_vol += vol
+                n += 1
+            except Exception:
+                continue
+        vwap_now = self._vwap_pv / self._vwap_vol if self._vwap_vol > 0 else None
+        if vwap_now:
+            log.info(f"VWAP warmup complete: seeded {n} session bars from "
+                     f"{session_open_pt.strftime('%m-%d %H:%M')} PT, session VWAP now ~ {vwap_now:.2f}")
+        else:
+            log.info("VWAP warmup: no bars returned")
+        self._vwap_warmed_session = self._vwap_session_date
+
+    @staticmethod
+    def _session_day_of(ts_pt):
+        """The CME session that a PT timestamp belongs to, keyed by the calendar date on
+        which that session CLOSES. Session runs 3pm PT (prior day) -> 3pm PT (this day).
+        A bar at/after 3pm PT belongs to the NEXT day's session."""
+        from datetime import time as _t, timedelta as _td
+        d = ts_pt.date()
+        return d + _td(days=1) if ts_pt.time() >= _t(15, 0) else d
+
+    def _update_session_vwap(self, candle):
+        """Maintain session-anchored VWAP across bars, resetting at each session open.
+        If a warmup already seeded this session, we keep accumulating on top of it; the
+        per-bar update only adds the newest bar (the live loop processes each new bar
+        once), so there's no double-counting."""
+        ts_pt = candle.ts.astimezone(PT)
+        sd = self._session_day_of(ts_pt)
+        if sd != self._vwap_session_date:
+            # New session and no warmup ran for it — start fresh from this bar.
+            self._vwap_pv = 0.0
+            self._vwap_vol = 0.0
+            self._vwap_session_date = sd
+        typical = (candle.high + candle.low + candle.close) / 3.0
+        vol = candle.volume if candle.volume and candle.volume > 0 else 1.0
+        self._vwap_pv += typical * vol
+        self._vwap_vol += vol
+        return self._vwap_pv / self._vwap_vol if self._vwap_vol > 0 else None
 
     # ── Auth / account / contract — same endpoints & fallback logic as
     # topstep_bot_v5.py's proven implementation ─────────────────────────────
@@ -1103,7 +1200,18 @@ class ChochLiveBot:
                 candle = Candle.from_bar(latest_bar, bar_ts)
                 candle_pt_time = candle.ts.astimezone(PT).time()
 
-                signal = self.wrapper.add_candle(candle, candle_pt_time, False)
+                # Once per session, backfill the full session's VWAP from the API so the
+                # accumulator isn't starting mid-session. Only needed when the filter is on.
+                cur_sd = self._session_day_of(candle.ts.astimezone(PT))
+                if (choch_fvg_bot.VWAP_EMA_FILTER
+                        and getattr(self, "_vwap_warmed_session", None) != cur_sd):
+                    await self._warmup_session_vwap(session, token)
+
+                # Compute session-anchored VWAP live and hand it to the engine, so the
+                # VWAP/9-SMA filter uses the correct CME-session VWAP (not an RTH-anchored
+                # approximation). Matches the backtest and the user's TradingView chart.
+                sv = self._update_session_vwap(candle)
+                signal = self.wrapper.add_candle(candle, candle_pt_time, False, session_vwap=sv)
 
                 # Heartbeat — one line per processed bar regardless of whether it produced a
                 # signal, so silence never means "is this stuck or just quiet" ambiguity.

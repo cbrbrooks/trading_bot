@@ -77,6 +77,34 @@ HTF_BIAS_MODE = "off"
 # closed beyond candle 2's high (bullish) / low (bearish). Default False (test only).
 BREAKAWAY_ONLY = False
 
+# ── 9-period moving-average mode for the VWAP/EMA filter ────────────────────
+# Controls what the `ema9` line actually is, to match TradingView's EMA panel:
+#   "sma"     -> Length 9 EMA with Smoothing Line=SMA, Length 9 => plotted line is a 9 SMA
+#   "ema"     -> single 9 EMA of close (no smoothing)
+#   "ema_ema" -> 9 EMA of close, then 9 EMA of that (Smoothing Line=EMA)
+# The user's screenshots have shown SMA and EMA smoothing at different times; default
+# "sma" matches the most recent screenshot. Override with CHOCH_MA_MODE.
+MA_MODE = "sma"
+
+# Source series for the 9-period MA (matches TradingView's EMA "Source" dropdown):
+#   "close" | "open" | "high" | "low" | "hl2" | "hlc3" | "ohlc4"
+# Default "close" matches the user's chart. Override with CHOCH_MA_SOURCE.
+MA_SOURCE = "close"
+
+# ── VWAP / 9-SMA price-location filter (ENABLED 2026-07-16) ─────────────────
+# Skip a LONG only when current price is BELOW BOTH the 9-SMA and session VWAP;
+# skip a SHORT only when price is ABOVE BOTH. The AND is essential — it isolates
+# genuinely unconfirmed reversals (blocked group won just 15.4%, z=-3.86) instead
+# of blindly blocking everything on one side of a line (VWAP-alone threw away 224
+# profitable trades, -$8,901). Validated over 18 months: +$2,780 (+9.6%) vs
+# baseline, positive in BOTH train (Jan25-Feb26) and test (Mar-Jun26), robust
+# across MA source ($877 spread over 7 sources, Close best) and smoothing type
+# (SMA $31,765 ~ single-EMA $31,934; double-EMA worst at $29,332). MA=SMA(9) on
+# Close, session-anchored VWAP (5pm CT / 3pm PT prior-day anchor). Only ever
+# removes trades. CAVEAT: 18-mo result is in-sample; true out-of-sample (test)
+# gain was a modest +$276 — deployed for the sound mechanism, watch live results.
+VWAP_EMA_FILTER = True
+
 SESSION_OPEN = time(6, 30)
 SESSION_CLOSE = time(12, 30) # no NEW entries after this — extended from 11:00 to 12:30 after
                               # a full sweep (11:00/11:30/12:00/12:30/12:45) showed 12:30 nearly
@@ -319,6 +347,14 @@ class CHOCHFVGEngine:
         self.candles: list[Candle] = []
         self.atr = None
 
+        # Session-anchored VWAP accumulators (reset per replay day = per engine instance)
+        self._vwap_pv = 0.0     # sum of typical_price * volume
+        self._vwap_vol = 0.0    # sum of volume
+        self.vwap = None
+        # 9-period MA of close (mode set by MA_MODE); _ema_base holds the inner EMA
+        self.ema9 = None
+        self._ema_base = None
+
         self.choch_bias = None          # "bullish" | "bearish" | None
         self.choch_swing_high = None
         self.choch_swing_low = None
@@ -341,6 +377,67 @@ class CHOCHFVGEngine:
         window = self.candles[-ATR_WINDOW:] if len(self.candles) >= ATR_WINDOW else self.candles
         ranges = [c.range for c in window if c.range > 0]
         self.atr = float(np.mean(ranges)) if ranges else None
+
+    def _update_vwap_ema(self):
+        """9 EMA (always engine-computed) + session-anchored VWAP.
+
+        VWAP: CME futures sessions run 5:00 PM CT (prior day) to 4:00 PM CT, so a
+        correct session VWAP must accumulate from ~3:00 PM PT the previous day — data
+        the engine does NOT see (it only receives RTH candles from 6:30 AM PT). When a
+        caller has precomputed the true session VWAP over the full 24h stream, it sets
+        `self.session_vwap_override` on the newest candle's slot and we use that. If no
+        override is supplied we fall back to accumulating from the first candle seen
+        (RTH anchor) — approximate, and flagged as such."""
+        c = self.candles[-1]
+
+        override = getattr(self, "_session_vwap_next", None)
+        if override is not None:
+            self.vwap = override
+            self._session_vwap_next = None
+        else:
+            typical = (c.high + c.low + c.close) / 3.0
+            vol = c.volume if c.volume and c.volume > 0 else 1.0
+            self._vwap_pv += typical * vol
+            self._vwap_vol += vol
+            self.vwap = self._vwap_pv / self._vwap_vol if self._vwap_vol > 0 else None
+
+        # 9-period line matching the user's TradingView setup. Their EMA panel shows
+        # Length 9, Smoothing Line = EMA, Smoothing Length 9 — i.e. a 9 EMA of close,
+        # then a 9 EMA OF THAT EMA (a doubly-smoothed EMA-of-EMA). Kept on attribute
+        # name `ema9` for continuity. Controlled by MA_MODE:
+        #   "ema_ema" -> 9 EMA of close, then 9 EMA of that (the user's current setting)
+        #   "ema"     -> single 9 EMA of close
+        #   "sma"     -> 9 SMA of close (the prior tested setting)
+        c = self.candles[-1]
+        k = 2.0 / (9 + 1)
+        mode = MA_MODE
+        src = MA_SOURCE
+        def _src(x):
+            if src == "close": return x.close
+            if src == "open": return x.open
+            if src == "high": return x.high
+            if src == "low": return x.low
+            if src == "hl2": return (x.high + x.low) / 2
+            if src == "hlc3": return (x.high + x.low + x.close) / 3
+            if src == "ohlc4": return (x.open + x.high + x.low + x.close) / 4
+            return x.close
+        if mode == "sma":
+            n = 9
+            src_vals = [_src(x) for x in self.candles[-n:]] if len(self.candles) >= n else [_src(x) for x in self.candles]
+            self.ema9 = sum(src_vals) / len(src_vals)
+        else:
+            cur_src = _src(c)
+            if self._ema_base is None:
+                self._ema_base = cur_src
+            else:
+                self._ema_base = cur_src * k + self._ema_base * (1 - k)
+            if mode == "ema":
+                self.ema9 = self._ema_base
+            else:  # ema_ema
+                if self.ema9 is None:
+                    self.ema9 = self._ema_base
+                else:
+                    self.ema9 = self._ema_base * k + self.ema9 * (1 - k)
 
     def _detect_choch(self, prev: Candle, curr: Candle):
         if prev.low < curr.low and curr.high > prev.high:
@@ -415,7 +512,8 @@ class CHOCHFVGReplayWrapper:
         else:
             self.htf = None
 
-    def add_candle(self, candle: Candle, pt_time: time, is_last_candle_of_session: bool) -> dict | None:
+    def add_candle(self, candle: Candle, pt_time: time, is_last_candle_of_session: bool,
+                   session_vwap: float = None) -> dict | None:
         eng = self.engine
 
         # Feed the HTF tracker FIRST and unconditionally — before any session/gate checks —
@@ -423,8 +521,14 @@ class CHOCHFVGReplayWrapper:
         if self.htf is not None:
             self.htf.add_1m_candle(candle)
 
+        # If the caller precomputed the true CME-session VWAP (anchored to 5pm CT / 3pm PT
+        # the prior day) over the full 24h stream, hand it to the engine for THIS candle.
+        if session_vwap is not None:
+            eng._session_vwap_next = session_vwap
+
         eng.candles.append(candle)
         eng._update_atr()
+        eng._update_vwap_ema()
 
         if eng.in_trade:
             exit_signal = eng._check_exit(candle)
@@ -475,6 +579,20 @@ class CHOCHFVGReplayWrapper:
                 continue
 
             fvg.consumed = True
+
+            # VWAP / 9-SMA price-location filter. Skip a LONG only if current price is BELOW
+            # BOTH the 9-SMA and session VWAP; skip a SHORT only if price is ABOVE BOTH.
+            # The AND is essential: tested VWAP-alone blocks 224 profitable trades (-$8,901,
+            # same failure as every quality filter), because price dips below VWAP in plenty
+            # of trades that recover. Requiring price below BOTH lines isolates the genuinely
+            # unconfirmed reversals — that blocked group wins just 15.4% (z=-3.86). Only ever
+            # REMOVES trades.
+            if VWAP_EMA_FILTER and eng.vwap is not None and eng.ema9 is not None:
+                price = curr.close
+                if fvg.type == "bullish" and price < eng.ema9 and price < eng.vwap:
+                    continue   # long blocked: price below both lines
+                if fvg.type == "bearish" and price > eng.ema9 and price > eng.vwap:
+                    continue   # short blocked: price above both lines
 
             # Breakaway FVG filter (Arjo method) — only take gaps where candle 3 closed
             # decisively beyond candle 2. Checked after the pattern's own hard gates so it
