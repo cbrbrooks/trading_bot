@@ -43,9 +43,22 @@ import choch_fvg_bot
 
 from signalrcore.hub_connection_builder import HubConnectionBuilder
 
+from delta_filter import DeltaTracker, DELTA_WINDOW_SECS
+
 MARKET_HUB_URL = "https://rtc.topstepx.com/hubs/market"
 
 MAX_BAR_STALENESS_SECS = 90
+
+# ── Version B is MANDATORY — enforced at import ────────────────────────────
+# Version B (the prev-bar close vs prior VWAP/9-SMA filter) shares the engine's
+# VWAP_EMA_FILTER flag, which also gates the engine's own close-VWAP check. This
+# pair is the out-of-sample-validated quality filter behind the +$4,390 result;
+# it only ever removes low-quality setups. Force the flag ON here, unconditionally,
+# so NO edit to choch_fvg_bot.py can ever silently disable Version B — this bot
+# always trades with it, in every mode. (Read at call-time by both the engine's
+# _check_entry and this bot's _version_b_filter_passes, so setting it at import
+# guarantees it is True before a single bar is processed.)
+choch_fvg_bot.VWAP_EMA_FILTER = True
 
 
 class IntrabarESBot(ChochLiveBot):
@@ -64,6 +77,70 @@ class IntrabarESBot(ChochLiveBot):
         # slippage where a bar-close entry fills several points off signal.
         # Enabled via --tick-only command-line flag.
         self.tick_only = "--tick-only" in sys.argv
+
+        # CHOCH-ONLY MODE — enter EXACTLY like the choch bot: on the engine's
+        # bar-close _check_entry decision (plus the Version B filter), and NOTHING
+        # from the intrabar tick path. This is the strategy the replay validated at
+        # +$4,390; the tick-entry experiment is turned off. Concretely this flag:
+        #   * skips SignalR entirely (the tick feed is only used for tick entries),
+        #   * disables tick-entry firing (belt-and-suspenders, even if SignalR ran),
+        #   * takes the parent's bar-close entries (so tick_only must be False).
+        # Everything else — brackets, exits, safety gates, Telegram, force-flat —
+        # is the parent's proven machinery, unchanged.
+        self.choch_only = "--choch-only" in sys.argv
+        if self.choch_only:
+            self.tick_only = False   # bar-close entries must NOT be refused
+
+        # ── ORDER-FLOW DELTA FILTER (NEW) ──────────────────────────────────
+        # Only fire a tick entry when the trailing 5-min cumulative delta CONFIRMS
+        # the trade direction (net buying for a long, net selling for a short).
+        # Backtest (3 months of ES trades, Databento 2026-04..07): delta AGREES
+        # ~64% win / +$1,969; delta OPPOSES ~24% win / -$2,319 (the false starts).
+        # ON by default — it only ever REMOVES trades, so it is strictly more
+        # conservative than the current bot. Disable with --no-delta-filter.
+        # Needs the SignalR tick stream, so it has no effect in --choch-only mode.
+        # NOTE: still UNPROVEN forward — the profitable side is only 14 backtest
+        # trades. This runs to COLLECT dry-run data, not as a trusted edge yet.
+        self.delta_filter = "--no-delta-filter" not in sys.argv
+        self.delta_tracker = DeltaTracker(window_secs=DELTA_WINDOW_SECS, log=log)
+        if self.delta_filter:
+            log.info(f"ORDER-FLOW DELTA FILTER ON (window={DELTA_WINDOW_SECS}s). Tick "
+                     f"entries fire only when 5-min delta confirms direction. "
+                     f"Disable with --no-delta-filter.")
+        else:
+            log.info("Order-flow delta filter OFF (--no-delta-filter).")
+
+        # ── COLLECT-ALL: log EVERY trade for dry-run data collection ────────
+        # Disables the daily RISK gates — MAX_TRADES_PER_DAY (the 3/day cap),
+        # MAX_CONSECUTIVE_LOSSES (the 2-loss stop), and DAILY_LOSS_LIMIT — so a
+        # dry-run records the FULL sample of trades to study, not a truncated
+        # 3/day slice that stops after 2 losses. STRICTLY dry-run only: these
+        # gates protect a funded account and must never be off with real money,
+        # so --collect-all is refused (caps stay ON) unless --dry-run is set too.
+        self.collect_all = "--collect-all" in sys.argv
+        if self.collect_all and not DRY_RUN:
+            log.error("REFUSING --collect-all in LIVE mode: it disables the daily risk "
+                      "caps, which must stay ON with real money. Caps remain ENFORCED. "
+                      "Use --collect-all only together with --dry-run.")
+            self.collect_all = False
+        if self.collect_all:
+            choch_fvg_bot.MAX_TRADES_PER_DAY   = 100000
+            choch_fvg_bot.MAX_CONSECUTIVE_LOSSES = 100000
+            choch_fvg_bot.DAILY_LOSS_LIMIT     = 1e12
+            log.info("COLLECT-ALL (dry-run only): daily caps DISABLED — no 3/day cap, "
+                     "no 2-consecutive-loss stop, no daily-loss stop. Logging EVERY "
+                     "delta-confirmed trade for data collection. (One position at a time "
+                     "still applies; trades are taken sequentially as each resolves.)")
+
+        # Version B is forced ON at import (see module top). Re-assert here and
+        # record it in the LOG FILE (the startup banner only prints to the
+        # terminal), so every session's choch_bot.log proves the filter was
+        # active for the trades it placed.
+        if not choch_fvg_bot.VWAP_EMA_FILTER:
+            choch_fvg_bot.VWAP_EMA_FILTER = True
+        log.info("Version B ENFORCED ON — mandatory prev-bar close vs prior "
+                 "VWAP/9-SMA filter (VWAP_EMA_FILTER=True). Cannot be disabled "
+                 "at runtime; applied to every entry.")
 
         # Set to True if SignalR startup failed hard (no tick entries this session).
         # Combined with tick_only=True, this means the bot will refuse to place
@@ -88,6 +165,18 @@ class IntrabarESBot(ChochLiveBot):
 
         # Armed FVG midpoint that the tick loop is watching
         self._armed_signal = None
+
+        # ── Confirm-at-close state ────────────────────────────────────────
+        # A PROVISIONAL tick entry: fired intrabar to capture the midpoint fill,
+        # but NOT yet confirmed by the engine's bar-close _check_entry. At the
+        # entry bar's close, if the engine confirms the same setup we keep it (a
+        # real choch trade at a better fill); if the bar's own action invalidated
+        # it (a CHOCH flip cleared the gap — the reason the naive tick took ~2x
+        # the trades), we FLATTEN immediately. Verified offline against Databento:
+        # 35 confirmed trades + 108 flattens over 26 days, churn only ~$154, net
+        # +$3,281 vs the choch bot's theoretical +$3,435 (which it can't get live
+        # because it fills at the bar close, not the midpoint).
+        self._provisional = None   # {direction, midpoint, fired_at} or None
 
         # Version B filter state — captured just before the engine consumes
         # each bar, so at intrabar entry time these reflect "the previous
@@ -142,6 +231,12 @@ class IntrabarESBot(ChochLiveBot):
         try:
             self._ticks_received += 1
 
+            # CHOCH-ONLY: never fire a tick entry. (SignalR is skipped in this
+            # mode, so this callback shouldn't run at all — but guard anyway so
+            # a stray subscription can never place an intrabar order.)
+            if self.choch_only:
+                return
+
             now = datetime.now(PT)
             if (now - self._last_tick_health_log).total_seconds() > 60:
                 log.info(f"Tick stream healthy | received={self._ticks_received} "
@@ -160,6 +255,12 @@ class IntrabarESBot(ChochLiveBot):
                 price = tr.get("price")
                 if price is None:
                     continue
+
+                # Feed the order-flow delta tracker on EVERY trade tick, so the
+                # trailing 5-min delta is warm whenever a midpoint touch fires.
+                if self.delta_filter:
+                    size = tr.get("volume") or tr.get("size") or tr.get("v") or 1
+                    self.delta_tracker.add_trade(price, size, tr)
 
                 armed = self._armed_signal
                 if armed is None or armed.get("bar_fired"):
@@ -188,6 +289,23 @@ class IntrabarESBot(ChochLiveBot):
                     armed["bar_fired"] = True
                     continue
 
+                # ── ORDER-FLOW DELTA CONFIRMATION (NEW) ────────────────────
+                # The false-start filter: only fire when the trailing 5-min
+                # delta confirms the trade's direction. Backtest: delta agrees
+                # ~64% win, opposes ~24% win. delta==0 (cold stream) does NOT
+                # confirm, so a warmup/quiet tape never fires an unconfirmed entry.
+                if self.delta_filter:
+                    agrees, dval = self.delta_tracker.agrees(armed["direction"])
+                    if not agrees:
+                        log.info(f"[DELTA-REJECT] touch @ {price} "
+                                 f"midpoint={armed['midpoint']} dir={armed['direction']} "
+                                 f"| 5-min delta={dval:+.0f} does NOT confirm — "
+                                 f"skipping (false-start filter).")
+                        armed["bar_fired"] = True
+                        continue
+                    log.info(f"[DELTA-OK] 5-min delta={dval:+.0f} confirms "
+                             f"{armed['direction']}.")
+
                 armed["bar_fired"] = True
                 log.info(f"TICK FIRED | price={price} "
                          f"touched midpoint={armed['midpoint']} "
@@ -215,6 +333,34 @@ class IntrabarESBot(ChochLiveBot):
                 log.info("Tick entry: aborted, entry already in flight")
                 return
 
+            # ── Safety gates ──────────────────────────────────────────────
+            # Tick entries bypass the engine's _check_entry, which is where the
+            # BAR path enforces the daily caps (choch_fvg_bot.py:555-560). Without
+            # replicating them here the tick path ignores every limit — observed
+            # 2026-07-21 dry-run, when 5 tick entries fired against a 3/day cap
+            # while the engine counter sat at 0/3 the whole session. Enforce the
+            # same three gates before committing to a tick entry.
+            eng = self.wrapper.engine if self.wrapper is not None else None
+            if eng is not None:
+                if eng.trades_today >= choch_fvg_bot.MAX_TRADES_PER_DAY:
+                    log.info(f"Tick entry BLOCKED — daily trade cap reached "
+                             f"({eng.trades_today}/{choch_fvg_bot.MAX_TRADES_PER_DAY}). "
+                             f"No more entries today.")
+                    armed["bar_fired"] = True
+                    return
+                if eng.consecutive_losses >= choch_fvg_bot.MAX_CONSECUTIVE_LOSSES:
+                    log.info(f"Tick entry BLOCKED — consecutive-loss limit reached "
+                             f"({eng.consecutive_losses}/"
+                             f"{choch_fvg_bot.MAX_CONSECUTIVE_LOSSES}).")
+                    armed["bar_fired"] = True
+                    return
+                if eng.daily_pnl <= -abs(choch_fvg_bot.DAILY_LOSS_LIMIT):
+                    log.info(f"Tick entry BLOCKED — daily loss limit reached "
+                             f"(daily_pnl=${eng.daily_pnl:.2f}, "
+                             f"limit=${choch_fvg_bot.DAILY_LOSS_LIMIT}).")
+                    armed["bar_fired"] = True
+                    return
+
             signal = {
                 "type": "entry",
                 "direction": armed["direction"],
@@ -224,12 +370,86 @@ class IntrabarESBot(ChochLiveBot):
                 "reason": (f"TICK ENTRY {armed['direction']} "
                            f"@ midpoint={armed['midpoint']} (touched at {price})"),
             }
-            # Delegate to parent bot's proven entry handler.
+            # DRY-RUN alert: the tick path delegates straight to the parent
+            # handler (below), which suppresses Telegram in dry-run. Without
+            # this, tick entries — the ONLY entries that fire in --tick-only
+            # mode — would never notify. Fire it here so the bar override and
+            # the tick path alert identically. Fail-safe: never raises.
+            await self._send_dry_run_entry_alert(self._shared_session, signal, "tick")
+
+            # Mark this a PROVISIONAL entry pending bar-close confirmation. We do
+            # NOT increment trades_today here — the engine's _check_entry does that
+            # only when it CONFIRMS at the bar close (see _handle_signal below). A
+            # flattened false start must not burn a daily-trade slot.
+            self._provisional = {
+                "direction": armed["direction"],
+                "midpoint": armed["midpoint"],
+                "stop": armed["stop"],
+                "target": armed["target"],
+                "fired_at_price": price,
+            }
+            log.info(f"PROVISIONAL tick entry placed @ midpoint={armed['midpoint']} "
+                     f"dir={armed['direction']} — awaiting bar-close confirmation.")
+
+            # Delegate to parent bot's proven entry handler (places the real
+            # bracket and captures the midpoint fill).
             # NOTE: we pass a session; the tick loop uses its own aiohttp
             # session (see _start_signalr_when_ready). Different session,
             # same broker, same token, functionally equivalent.
             await ChochLiveBot._handle_signal(self, self._shared_session,
                                               self.token, signal)
+
+    async def _send_dry_run_entry_alert(self, session, signal, source):
+        """In dry-run, push a Telegram alert for an entry the bot WOULD have
+        taken. The parent bot suppresses ALL Telegram in dry-run, and the
+        tick-entry path delegates straight to the parent (bypassing the bar
+        override), so without a shared helper neither path would notify.
+        Used by both the tick path and the bar override so they alert with
+        identical formatting. Fail-safe: a Telegram error can never interrupt
+        evaluation or trading."""
+        if not (DRY_RUN and self.notifier is not None):
+            return
+        try:
+            await self.notifier.send(
+                session,
+                f"ES {signal['direction'].upper()} would fire "
+                f"@ signal={signal['entry_price']} "
+                f"stop={signal['stop']} target={signal['target']} "
+                f"| source={source} | {signal.get('reason', '')}",
+                prefix="[DRY-RUN ENTRY]",
+            )
+        except Exception as e:
+            log.warning(f"Dry-run Telegram alert failed: {e}")
+
+    async def _flatten_provisional(self, session, token, prov):
+        """Close a provisional tick entry the engine did NOT confirm at bar close.
+        Reuses the parent's proven flatten path (Position/closeAll), then resets
+        the bracket-tracking state so the bot is clean for the next setup. In
+        dry-run the parent's _flatten_all is a no-op log, so this exercises the
+        full confirm/flatten DECISION path without placing or closing real orders
+        — which is exactly what a dry-run session validates. Fail-safe: a flatten
+        error is logged loudly but never left silent."""
+        try:
+            await self._flatten_all(
+                session, token,
+                f"Provisional tick entry not confirmed at bar close "
+                f"(dir={prov['direction']} @ midpoint={prov['midpoint']})")
+        except Exception as e:
+            log.error(f"FLATTEN of unconfirmed provisional FAILED — check the "
+                      f"account manually for an open position: {e}", exc_info=True)
+        # Clear bracket-tracking state (the position, if any, is now closed).
+        self._awaiting_bracket_close = False
+        self._live_entry_fill = None
+        self._bracket_entry_signal = None
+        if self.notifier is not None:
+            try:
+                await self.notifier.send(
+                    session,
+                    f"Tick entry {prov['direction']} @ {prov['midpoint']} not "
+                    f"confirmed at bar close — flattened (setup invalidated).",
+                    prefix="[FLATTEN]")
+            except Exception:
+                pass
 
     async def _connect_signalr(self):
         """Open (or re-open) SignalR market hub and subscribe to trades."""
@@ -367,9 +587,25 @@ class IntrabarESBot(ChochLiveBot):
             self._armed_signal = None
             return
 
-        # Freshest UNCONSUMED FVG matching choch_bias that ALSO passes fib
-        # validity — the bar loop uses fib_valid as a hard gate before firing,
-        # so we must too, or we'd fire tick-entries the bar loop would reject.
+        # ── ATR volatility gate ───────────────────────────────────────────
+        # The bar path (choch_fvg_bot add_candle) refuses ALL entries while
+        # 1-min ATR > ATR_MAX_THRESHOLD — the strategy sits out extreme
+        # volatility, which clusters in the early session. The tick loop was
+        # skipping this gate, so it fired on early high-ATR chop the bar bot
+        # avoids, then burned the 3-trade daily cap before the calmer midday
+        # setups the bar bot actually takes. Applying it here realigns tick
+        # selection with the bar path. Checked at arming (just-closed bar's
+        # ATR), matching when the bar path would evaluate the next entry.
+        atr = getattr(eng, "atr", None)
+        if atr is not None and atr > choch_fvg_bot.ATR_MAX_THRESHOLD:
+            self._armed_signal = None
+            return
+
+        # Freshest UNCONSUMED FVG matching choch_bias that passes EVERY hard gate
+        # the bar loop's _check_entry applies, in the same order. Any gate the
+        # tick path skips here means it fires on setups the strategy rejects — the
+        # 2026-07-13 quality filter drifted out of sync exactly this way, silently
+        # doubling the live tick bot's trade count against a filtered backtest.
         candidate = None
         for fvg in reversed(active_fvgs):
             if getattr(fvg, "consumed", False):
@@ -377,13 +613,38 @@ class IntrabarESBot(ChochLiveBot):
             fvg_type = getattr(fvg, "type", None)
             if fvg_type != choch_bias:
                 continue
-            # Fib validity check — matches engine's _check_entry gating
+            # Fib validity — matches _check_entry line 574.
             try:
                 if not eng._fib_valid(fvg):
                     continue
             except Exception:
-                # If the engine's fib check errors, be conservative and skip
+                # If the engine's fib check errors, be conservative and skip.
                 continue
+            # Breakaway-only filter — matches _check_entry line 600 (off by default).
+            if choch_fvg_bot.BREAKAWAY_ONLY and not getattr(fvg, "breakaway", False):
+                continue
+            # QUALITY FILTER — matches _check_entry lines 616-623. The bar path
+            # runs every setup through evaluate_entry_quality and skips the
+            # low-quality ones (wide + stale gaps); the tick path MUST too, or it
+            # takes trades the strategy is configured to reject. The filter only
+            # actually uses FVG width and age — the other args are accepted for
+            # call-site parity and deliberately ignored (see choch_quality_filters).
+            if choch_fvg_bot.QUALITY_FILTERS_ENABLED:
+                try:
+                    from choch_quality_filters import evaluate_entry_quality
+                    cai = getattr(fvg, "created_at_index", -1)
+                    fvg_age = (len(eng.candles) - 1 - cai) if cai >= 0 else 0
+                    allowed, _, _ = evaluate_entry_quality(
+                        eng.candles, eng.choch_bias,
+                        getattr(eng, "choch_swing_high", None),
+                        getattr(eng, "choch_swing_low", None),
+                        fvg.top - fvg.bottom, fvg_age, None)
+                    if not allowed:
+                        continue  # quality-blocked; try an older active FVG
+                except Exception:
+                    # Scoring error → skip, matching the fib-check fail-safe: never
+                    # arm on a setup we couldn't fully validate.
+                    continue
             candidate = fvg
             break
         if not candidate:
@@ -398,32 +659,71 @@ class IntrabarESBot(ChochLiveBot):
             return
 
         direction = "long" if choch_bias == "bullish" else "short"
-        # Use BROKER_MIN_STOP_POINTS (1.0pt = 4 ticks) as the geometry floor
-        # so armed signals are consistent with what the broker will accept.
-        # The 4-tick minimum is enforced again at order-submission time in the
-        # parent bot's _handle_signal via max(4, ...), so this is belt-and-suspenders.
-        min_stop_floor = getattr(choch_fvg_bot, "BROKER_MIN_STOP_POINTS",
-                                 choch_fvg_bot.MIN_STOP_POINTS)
-        if direction == "long":
-            stop = bot if bot is not None else mid - min_stop_floor
-            risk = mid - stop
-            if risk < min_stop_floor:
-                # FVG geometry tighter than broker minimum — widen the stop
-                stop = mid - min_stop_floor
-                risk = min_stop_floor
-            target = mid + choch_fvg_bot.RR_MULTIPLE * risk
-        else:
-            stop = top if top is not None else mid + min_stop_floor
-            risk = stop - mid
-            if risk < min_stop_floor:
-                stop = mid + min_stop_floor
-                risk = min_stop_floor
-            target = mid - choch_fvg_bot.RR_MULTIPLE * risk
 
-        # Reject setups outside the acceptable risk band (matches engine)
-        if risk < min_stop_floor or risk > choch_fvg_bot.MAX_STOP_POINTS:
+        # ── Genuine-retrace gate ──────────────────────────────────────────
+        # Only arm while the LAST CLOSED bar sits on the correct side of the
+        # midpoint — above it for a long, below it for a short. That is the
+        # setup's premise: price is poised to retrace DOWN (long) / UP (short)
+        # INTO the frozen gap. Once price has already crossed the midpoint, the
+        # retrace has happened (or blown through), and a later tick touch is a
+        # continuation entry, NOT the retrace the strategy trades. Without this
+        # the tick loop fires on blow-through bars the bar path rejects — the
+        # source of its ~2x trade count and lower win rate. The midpoint stays
+        # frozen from the prior FVG bars; this only controls WHEN it's live.
+        last_close = self._prev_bar_close
+        if last_close is not None:
+            if direction == "long" and last_close <= mid:
+                self._armed_signal = None
+                return
+            if direction == "short" and last_close >= mid:
+                self._armed_signal = None
+                return
+
+        # Stop/target geometry — replicate _check_entry (choch_fvg_bot.py 625-669)
+        # EXACTLY so tick and bar risk the SAME amount on the SAME setup:
+        #   1. natural FVG-width risk drives the risk-BAND quality check
+        #      (MIN_STOP_POINTS..MAX_STOP_POINTS), NOT the broker floor;
+        #   2. FIXED_STOP_POINTS (if > 0) then overrides the stop distance so
+        #      every trade risks a flat 1.0pt (the mode the strategy runs in);
+        #   3. broker-minimum padding only applies when NOT in fixed mode;
+        #   4. the dollar risk cap is checked on the SUBMITTED stop.
+        entry = mid
+        if direction == "long":
+            stop = bot if bot is not None else entry - choch_fvg_bot.MIN_STOP_POINTS
+            risk_points = entry - stop
+        else:
+            stop = top if top is not None else entry + choch_fvg_bot.MIN_STOP_POINTS
+            risk_points = stop - entry
+
+        # Risk-band filter on the NATURAL width (matches _check_entry line 633).
+        if (risk_points <= 0
+                or risk_points > choch_fvg_bot.MAX_STOP_POINTS
+                or risk_points < choch_fvg_bot.MIN_STOP_POINTS):
             self._armed_signal = None
             return
+
+        # FIXED_STOP override (matches _check_entry lines 640-642 + 655-660).
+        if choch_fvg_bot.FIXED_STOP_POINTS > 0:
+            risk_points = choch_fvg_bot.FIXED_STOP_POINTS
+            stop = (entry - risk_points if direction == "long"
+                    else entry + risk_points)
+            broker_stop = risk_points
+        else:
+            broker_stop = max(risk_points, choch_fvg_bot.BROKER_MIN_STOP_POINTS)
+            if broker_stop != risk_points:
+                stop = (entry - broker_stop if direction == "long"
+                        else entry + broker_stop)
+
+        # Dollar risk cap on the SUBMITTED stop (matches _check_entry 664-666).
+        total_risk = broker_stop * choch_fvg_bot.POINT_VALUE * choch_fvg_bot.CONTRACTS
+        if total_risk > choch_fvg_bot.MAX_TRADE_RISK_DOLLARS:
+            self._armed_signal = None
+            return
+
+        # Target uses risk_points (fixed 1.0pt -> 3.0pt target at RR 3.0).
+        target = (entry + choch_fvg_bot.RR_MULTIPLE * risk_points if direction == "long"
+                  else entry - choch_fvg_bot.RR_MULTIPLE * risk_points)
+        risk = broker_stop  # actual submitted risk, recorded on the armed dict below
 
         existing = self._armed_signal
         bar_fired = (existing is not None and
@@ -466,6 +766,60 @@ class IntrabarESBot(ChochLiveBot):
 
     async def _handle_signal(self, session, token, signal):
         """Override parent's entry handler. Non-entry signals pass through."""
+        # ── Confirm-at-close resolution ───────────────────────────────────
+        # The parent bar loop calls this once per bar close with the engine's
+        # _check_entry decision. If a tick fired a PROVISIONAL during the bar that
+        # just closed, resolve it now: the engine is the authority on WHICH trades
+        # to take (it decides off the completed bar, including any CHOCH flip the
+        # tick couldn't see). Confirm -> keep the tick's better fill; reject ->
+        # flatten the false start. This is what makes the tick take the choch
+        # bot's EXACT trades instead of ~2x of them.
+        if self._provisional is not None:
+            prov = self._provisional
+            self._provisional = None
+            engine_confirms = (signal is not None and signal.get("type") == "entry")
+            if engine_confirms:
+                log.info(f"Provisional CONFIRMED at bar close "
+                         f"(dir={prov['direction']} @ midpoint={prov['midpoint']}). "
+                         f"Keeping the tick fill; engine now owns the exit. The "
+                         f"engine's own entry signal is consumed here so no second "
+                         f"bracket is placed.")
+                # _check_entry already set eng.in_trade + trades_today; the tick's
+                # bracket is live (_awaiting_bracket_close). Swallow the engine's
+                # duplicate entry signal — the existing bracket IS the position.
+                return
+            # NOT re-confirmed by the completed bar. In the OLD (pre-delta)
+            # design we flattened here, treating the unconfirmed tick as a
+            # "false start." That flatten is what produced the catastrophic
+            # bar-close exits (backtested -$206k flatten-at-close vs -$85k
+            # let-run). The DELTA filter is now the false-start gate: a tick
+            # only fires after trailing 5-min delta AGREES with it, so a
+            # delta-confirmed fill has already earned the right to run its
+            # bracket. Do NOT flatten. The real broker bracket (placed at the
+            # tick via ChochLiveBot._handle_signal) stays live and runs to its
+            # 1pt stop / 3pt target exactly like the databento backtest. Sync
+            # the engine's internal state so it tracks the live position and
+            # will not attempt a duplicate entry while this one is open.
+            eng = self.wrapper.engine if self.wrapper is not None else None
+            if eng is not None and not eng.in_trade:
+                eng.in_trade = True
+                eng.trades_today += 1
+                eng.position = prov["direction"]
+                eng.entry_price = prov["midpoint"]
+                eng.stop_price = prov["stop"]
+                eng.target_price = prov["target"]
+                eng.breakeven_trigger = None
+                eng.breakeven_done = False
+                eng._last_theoretical_exit_pnl = 0.0
+            log.info(f"Provisional NOT re-confirmed by the completed bar "
+                     f"(dir={prov['direction']} @ midpoint={prov['midpoint']}) — "
+                     f"but it was DELTA-CONFIRMED at the tick, so it is KEPT (NOT "
+                     f"flattened). Its live 1pt/3pt bracket runs to stop or target, "
+                     f"matching the databento backtest. "
+                     f"stop={prov['stop']} target={prov['target']}")
+            # The live bracket IS the position; nothing else to place.
+            return
+
         if signal is None or signal.get("type") != "entry":
             return await super()._handle_signal(session, token, signal)
 
@@ -530,22 +884,10 @@ class IntrabarESBot(ChochLiveBot):
                 return
 
             # In DRY-RUN, fire a Telegram alert BEFORE delegating to the
-            # parent (which will log "[DRY RUN] Would place..." and return
-            # without notifying). The parent bot suppresses Telegram in
-            # dry-run — we override that here so evaluation from the phone
-            # is possible.
-            if DRY_RUN and self.notifier is not None:
-                try:
-                    await self.notifier.send(
-                        session,
-                        f"ES {signal['direction'].upper()} would fire "
-                        f"@ signal={signal['entry_price']} "
-                        f"stop={signal['stop']} target={signal['target']} "
-                        f"| source={source} | {reason_str}",
-                        prefix="[DRY-RUN ENTRY]",
-                    )
-                except Exception as e:
-                    log.warning(f"Dry-run Telegram alert failed: {e}")
+            # parent (which logs "[DRY RUN] Would place..." and returns
+            # without notifying). Shared with the tick path via the helper
+            # so both entry sources alert identically.
+            await self._send_dry_run_entry_alert(session, signal, source)
 
             await super()._handle_signal(session, token, signal)
 
@@ -662,6 +1004,12 @@ class IntrabarESBot(ChochLiveBot):
         escapes without being logged, the task fails silently and the tick
         loop never comes online. We catch and LOG all exceptions explicitly.
         """
+        if self.choch_only:
+            log.info("CHOCH-ONLY mode: skipping SignalR. Entries come only from "
+                     "the engine's bar-close _check_entry (+ Version B) — the "
+                     "choch strategy the replay validated at +$4,390.")
+            return
+
         try:
             log.info("SignalR starter: waiting for parent bot auth to complete...")
             for _ in range(60):
@@ -742,24 +1090,40 @@ class IntrabarESBot(ChochLiveBot):
 
 def main():
     tick_only = "--tick-only" in sys.argv
+    choch_only = "--choch-only" in sys.argv
     print("=" * 70)
-    print("  CHOCH/FVG INTRABAR BOT — ES 2 CONTRACTS")
+    print(f"  CHOCH/FVG INTRABAR BOT — ES {choch_fvg_bot.CONTRACTS} CONTRACT"
+          f"{'S' if choch_fvg_bot.CONTRACTS != 1 else ''}")
     if DRY_RUN:
         print("  ==> DRY RUN MODE — no real orders will be placed")
     else:
         print("  ==> LIVE MODE — REAL orders")
-    if tick_only:
+    if choch_only:
+        print("  ==> CHOCH-ONLY MODE — entries ONLY from the engine's bar-close")
+        print("      _check_entry (+ Version B). Tick entry OFF. SignalR OFF.")
+        print("      This is the strategy the replay validated at +$4,390.")
+    elif tick_only:
         print("  ==> TICK-ONLY MODE — bar-loop entries will be REFUSED")
     print("=" * 70)
-    print(f"  Instrument:     ES (2 contracts)")
+    print(f"  Instrument:     ES ({choch_fvg_bot.CONTRACTS} contract"
+          f"{'s' if choch_fvg_bot.CONTRACTS != 1 else ''}) | "
+          f"stop {choch_fvg_bot.FIXED_STOP_POINTS}pt / target "
+          f"{choch_fvg_bot.FIXED_STOP_POINTS * choch_fvg_bot.RR_MULTIPLE:g}pt")
     print(f"  Session:        {choch_fvg_bot.SESSION_OPEN} - "
           f"{choch_fvg_bot.SESSION_CLOSE} PT")
     print(f"  Force flat:     {choch_fvg_bot.FORCE_FLAT_TIME} PT")
     print(f"  Max trades:     {choch_fvg_bot.MAX_TRADES_PER_DAY}/day")
     print(f"  Max consec L:   {choch_fvg_bot.MAX_CONSECUTIVE_LOSSES}")
     print(f"  Daily loss lim: ${choch_fvg_bot.DAILY_LOSS_LIMIT}")
-    print(f"  Filter:         Version B (prev-bar close + prior VWAP/9-SMA)")
-    if tick_only:
+    print(f"  Filter:         Version B — ENFORCED ON (mandatory, "
+          f"VWAP_EMA_FILTER={choch_fvg_bot.VWAP_EMA_FILTER})")
+    print(f"  Delta filter:   {'ON — 5-min order-flow must confirm entry (NEW; collecting dry-run data)' if '--no-delta-filter' not in sys.argv else 'OFF (--no-delta-filter)'}")
+    if "--collect-all" in sys.argv and DRY_RUN:
+        print(f"  Daily caps:     DISABLED (--collect-all) — logging EVERY trade; no 3/day, 2-loss, or daily-loss stop")
+    if choch_only:
+        print(f"  Entry:          CHOCH-ONLY — engine bar-close _check_entry "
+              f"(+ Version B)")
+    elif tick_only:
         print(f"  Entry:          TICK-LEVEL ONLY via GatewayTrade "
               f"(bar-loop REFUSED)")
     else:

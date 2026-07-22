@@ -133,12 +133,14 @@ SESSION_CLOSE = time(12, 30) # no NEW entries after this — extended from 11:00
                               # the extra ~$2,650 the 1:10 PM version shows over the same window.
 FORCE_FLAT_TIME = time(13, 10)  # 1:10 PM PT, matches Topstep's 3:10 PM CT rule
 
-CONTRACTS = 2                 # 2 ES contracts — raised from 1 (tested via CHOCH_CONTRACTS=2
-                               # override first, confirmed same 78 trades/Jan-Jul-2026 as the
-                               # 1-contract run, P&L exactly 2.0x: $2,243.75 -> $4,487.50).
-                               # MAX_TRADE_RISK_DOLLARS and DAILY_LOSS_LIMIT below are scaled
-                               # 2x to match — see their comments. MAX_STOP_POINTS is NOT scaled:
-                               # it's a pure point-distance filter, independent of contract count.
+CONTRACTS = 1                 # 1 ES contract. Set 2026-07-22 for the Topstep-safe config
+                               # (2pt stop / 3pt target, 1 contract). Validated Jan 2025-Jul 2026:
+                               # ~57% WR full-history (63% over Jan-Jul 2026), ~$976/mo at 0.25pt
+                               # slippage, and MAX equity drawdown only ~$700 — fits any account.
+                               # NOTE: 1 contract x 2.0pt stop = the SAME $100/loss dollar risk as
+                               # the prior 2 contracts x 1.0pt, so MAX_TRADE_RISK_DOLLARS (110) and
+                               # DAILY_LOSS_LIMIT (230) below stay correctly calibrated unchanged.
+                               # (History: was 2 during the 1pt-stop phase; P&L scaled 2.0x then.)
 BROKER_MIN_STOP_POINTS = 1.0  # TopstepX API accepts bracket stops >= 4 ticks (1.0pt). Confirmed
                                # ES) — this pads the stop out to that minimum when the setup's
                                # own risk_points is tighter. Set to 1.0 as the default after
@@ -150,7 +152,13 @@ BROKER_MIN_STOP_POINTS = 1.0  # TopstepX API accepts bracket stops >= 4 ticks (1
                                # 25× better than "just filter tight setups out" ($804 at
                                # MIN_STOP_POINTS=1.0). Set to 0.0 to run the raw backtest
                                # without any broker-compliance widening.
-FIXED_STOP_POINTS = 1.0       # Fixed 1.0pt stop on every trade (uniform geometry mode).
+FIXED_STOP_POINTS = 2.0       # Fixed 2.0pt stop on every trade (uniform geometry mode).
+                               # Set 2026-07-22: 2pt stop + 3pt target (RR_MULTIPLE=1.5 below) was
+                               # the best risk-adjusted config in the Jul-2026 stop/target sweep —
+                               # a 1pt stop was getting tagged by intrabar noise before the move.
+                               # 2.0pt x $50 x 1 contract = $100 risk/trade (matches the old cap).
+                               # ---- historical note (prior 1.0pt setting) ----
+                               # Fixed 1.0pt stop on every trade (uniform geometry mode).
                                # CONFIRMED 2026-07-14 via a live API test (test_bracket_ticks_live.py):
                                # a bracket order with stopLossBracket ticks=4 was ACCEPTED by the
                                # TopstepX API (orderId 3270048512, success=True). The ">5 ticks"
@@ -203,7 +211,13 @@ MAX_TRADE_RISK_DOLLARS = 110.0 # Backstop cap on per-trade dollar risk (stop dis
                                # this stays a redundant backstop consistent with MAX_STOP_POINTS
                                # (both should reject the same trades) rather than becoming a NEW,
                                # tighter, unintended filter that only 1-contract math satisfies.
-RR_MULTIPLE = 3.0            # target = entry +/- 3R (= 3.0pt on every trade in fixed-stop mode).
+RR_MULTIPLE = 1.5            # target = entry +/- 1.5R. With FIXED_STOP_POINTS=2.0 that is a
+                               # 3.0pt target ($150 at 1 contract) on every trade. Set 2026-07-22
+                               # so the 2pt stop pairs with a 3pt target (the validated 2:3 geometry,
+                               # ~57-63% WR). NOTE: RR is now 1.5 because the STOP widened to 2pt,
+                               # not because the target shrank — target is still 3.0pt.
+                               # ---- historical note (prior RR_MULTIPLE=3.0, 1pt-stop phase) ----
+                               # target = entry +/- 3R (= 3.0pt on every trade in fixed-stop mode).
                                # Changed 2026-07-13 from 7.0 as part of the fixed-stop switch.
                                # Backtest sweep across RR=2/3/4/5/6/7 at FIXED_STOP=1.0:
                                #   RR=2: $17,444, 47.3% WR, 510 trades (Jan +$950, safest month)
