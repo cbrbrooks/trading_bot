@@ -779,6 +779,33 @@ class IntrabarESBot(ChochLiveBot):
             self._provisional = None
             engine_confirms = (signal is not None and signal.get("type") == "entry")
             if engine_confirms:
+                # GUARD (added 2026-07-28): if the broker bracket has ALREADY closed this
+                # trade — a fast stop/target that resolved WITHIN the same bar the entry
+                # fired on — the trade is DONE and its real P&L was already booked and
+                # reconciled at the broker close. The engine's _check_entry, run on this
+                # bar close, has just re-armed a PHANTOM open position (in_trade=True); on
+                # the NEXT bar it would book a DUPLICATE theoretical exit, doubling
+                # daily_pnl. (Observed live 2026-07-28: a 15-sec stop-out logged
+                # daily_pnl=-$207.56 for a single -$103.78 loss.) Force the engine flat.
+                # trades_today / consecutive_losses are already correct and untouched;
+                # only the phantom OPEN position is cleared so no second exit is booked.
+                if not self._awaiting_bracket_close:
+                    eng = self.wrapper.engine if self.wrapper is not None else None
+                    if eng is not None:
+                        eng.in_trade = False
+                        eng.position = None
+                        eng.entry_price = None
+                        eng.stop_price = None
+                        eng.target_price = None
+                        eng.breakeven_trigger = None
+                        eng.breakeven_done = False
+                        eng._last_theoretical_exit_pnl = 0.0
+                    log.info(f"Provisional CONFIRMED at bar close, but the broker bracket "
+                             f"ALREADY closed this trade within the entry bar "
+                             f"(dir={prov['direction']} @ midpoint={prov['midpoint']}). "
+                             f"Engine forced FLAT to prevent a duplicate theoretical exit "
+                             f"— real P&L was already booked at the broker close.")
+                    return
                 log.info(f"Provisional CONFIRMED at bar close "
                          f"(dir={prov['direction']} @ midpoint={prov['midpoint']}). "
                          f"Keeping the tick fill; engine now owns the exit. The "
@@ -802,15 +829,21 @@ class IntrabarESBot(ChochLiveBot):
             # will not attempt a duplicate entry while this one is open.
             eng = self.wrapper.engine if self.wrapper is not None else None
             if eng is not None and not eng.in_trade:
-                eng.in_trade = True
                 eng.trades_today += 1
-                eng.position = prov["direction"]
-                eng.entry_price = prov["midpoint"]
-                eng.stop_price = prov["stop"]
-                eng.target_price = prov["target"]
-                eng.breakeven_trigger = None
-                eng.breakeven_done = False
-                eng._last_theoretical_exit_pnl = 0.0
+                # Same guard as the CONFIRMED path (added 2026-07-28): only hand the OPEN
+                # position to the engine if the broker bracket is STILL live. If it already
+                # closed within the entry bar (fast stop/target), the real P&L is already
+                # booked — leave the engine FLAT so it can't book a duplicate theoretical
+                # exit on the next bar.
+                if self._awaiting_bracket_close:
+                    eng.in_trade = True
+                    eng.position = prov["direction"]
+                    eng.entry_price = prov["midpoint"]
+                    eng.stop_price = prov["stop"]
+                    eng.target_price = prov["target"]
+                    eng.breakeven_trigger = None
+                    eng.breakeven_done = False
+                    eng._last_theoretical_exit_pnl = 0.0
             log.info(f"Provisional NOT re-confirmed by the completed bar "
                      f"(dir={prov['direction']} @ midpoint={prov['midpoint']}) — "
                      f"but it was DELTA-CONFIRMED at the tick, so it is KEPT (NOT "
