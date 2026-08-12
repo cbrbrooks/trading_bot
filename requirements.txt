@@ -20,3 +20,14 @@ zstandard>=0.25.0
 
 # Building the .xlsx daily-summary workbooks
 openpyxl>=3.1.0
+
+# ── SignalR real-time market feed (live bot) — PINNED, DO NOT CHANGE ──────────
+# The live tick/bar feed runs on signalrcore, which pulls in websocket-client.
+# On 2026-08-05, websocket-client auto-updated to 1.9.0 and broke the feed on
+# Python 3.14: connections aborted mid-stream (WinError 10053), repeated
+# "Bar fetch failed (TimeoutError)", and a DATA FEED STALL — the bot could not
+# trade. Rolling websocket-client back to 1.8.0 fixed it immediately. These are
+# pinned with == so a future `pip install`/upgrade cannot pull the broken
+# version again. Do NOT loosen these to >= or bump them without testing live.
+signalrcore==1.0.2
+websocket-client==1.8.0
