@@ -1,79 +1,71 @@
 # CHOCH/FVG Trading Bot
 
-Automated ES futures trading bot for TopstepX, implementing a CHOCH (Change of
-Character) + FVG (Fair Value Gap) strategy, plus the backtesting and analysis
-tooling used to develop and validate it.
+An automated ES futures trading bot for TopstepX. It trades a CHOCH (Change of
+Character) + FVG (Fair Value Gap) strategy on live tick data, and the repo also
+holds the backtesting and research tools used to build and validate it.
 
-## ⚠️ Before anything else
+## How it works
 
-- **Never commit your `.env` file.** It holds your TopStep API key. Anyone with
-  it can trade your account. It is git-ignored; keep it that way.
-- **TopStep does not permit automated trading from a VPS / remote server.** Run
-  the bot on your own machine only. Confirm current policy with TopStep support.
-- **This bot trades real money.** Backtest results are theoretical and run
-  somewhat better than live fills. Watch early trades closely.
+1. **Market data.** A SignalR connection streams live ES ticks from the TopstepX API.
+2. **Signal.** The strategy engine builds candles, detects a change of character,
+   and waits for price to return into a fair value gap. Quality filters (price
+   location vs. VWAP/9 SMA, minimum stop size, entry window) reject weak setups.
+3. **Order.** Each entry goes out as a broker-side bracket order (stop + target),
+   so an open position stays protected even if the bot or its connection drops.
+4. **Safety.** Daily loss limit, consecutive-loss stop, a forced flat time, a
+   post-close sweep that cancels stray orders, and a separate watchdog process
+   that alerts if the bot freezes or crashes.
+5. **Alerts.** Optional Telegram messages for entries, exits, safety stops, and
+   data-feed stalls. A Telegram outage can never interrupt trading.
+
+## Repo layout
+
+```
+bot/          live trading code: strategy engine, live bots, watchdogs
+backtests/    replay engines and backtest runners (TopstepX API + Databento data)
+research/     one-off studies: delta filter validation, MAE study, log analysis
+tests/        mocked-broker tests for bracket orders, limit orders, entry fixes
+docs/         backtest write-ups, audits, and the go-live checklist
+```
+
+**Key files in `bot/`:**
+- `choch_fvg_bot.py`: strategy engine (all tunable settings live here)
+- `choch_bot_live.py`: live bot with bracket orders and fill tracking
+- `intrabar_es_bot.py`: tick-level entry version (also `_2ct` / `_3ct` sizes)
+- `topstep_bot_v5.py`: shared auth, Candle class, and constants
+- `watchdog.py`: independent freeze/crash monitor (one per bot size)
 
 ## Setup
 
 ```bash
 pip install -r requirements.txt
-cp .env.example .env        # then edit .env with your real TopStep API key
+cp bot/.env.example bot/.env      # then add your TopstepX API key
 ```
 
-Confirm your settings loaded correctly:
+The `.env` file lives in `bot/` because the bots and watchdogs read it from
+their own folder. It is git-ignored and never committed.
+
+## Running (from the repo root)
 
 ```bash
-python -c "import choch_fvg_bot as m; print('CONTRACTS:', m.CONTRACTS, '| RR:', m.RR_MULTIPLE, '| SESSION_CLOSE:', m.SESSION_CLOSE, '| MIN_STOP:', m.MIN_STOP_POINTS, '| USE_BREAKEVEN:', m.USE_BREAKEVEN)"
+python bot/choch_bot_live.py --dry-run     # paper mode: logs decisions, places NO orders
+python bot/intrabar_es_bot.py --dry-run    # tick-level version, paper mode
+python bot/watchdog.py                     # run alongside the bot in a second window
 ```
 
-## Running
+Logs (`choch_bot.log`) and trade history are written into `bot/`.
+
+**Backtests** take a Databento file path or a date range, for example:
 
 ```bash
-python choch_bot_live.py --dry-run   # paper mode — logs decisions, places NO orders
-python choch_bot_live.py             # LIVE — places real bracket orders
+python backtests/choch_databento_replay.py data/<file>.csv.zst 2026-01-01 2026-06-01
+python backtests/choch_batch_replay.py 2026-10-01 2026-10-30
 ```
 
-Start before 6:30 AM PT (the entry window is 6:30-11:00 AM PT). Press Enter at
-the startup watchdog prompt. Exits are managed broker-side via bracket orders,
-so an open position stays protected even if the bot or its connection drops.
+## Notes
 
-## Telegram alerts (optional)
-
-Set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` in `.env` (see `.env.example`
-for how to get them) and the bot pushes messages to your phone for: trade
-entries, trade exits (with real P&L), safety-gate stops (daily loss limit /
-consecutive losses), errors needing attention, and a data-feed stall alert if
-no market data arrives for 3+ minutes during the session (plus a recovery
-message when it resumes). A `[STARTUP]` test message is sent when the bot
-launches — if you don't receive it, fix the token/chat ID before relying on
-alerts. Alerts are fail-safe: a Telegram outage can never interrupt trading.
-
-## Files
-
-**The bot:**
-- `choch_fvg_bot.py` — the strategy engine (all tunable settings live here)
-- `choch_bot_live.py` — the live trading bot (bracket orders, fill tracking)
-- `topstep_bot_v5.py` — shared dependency: auth, Candle class, constants
-- `databento_loader.py` — shared dependency: historical data loading
-
-**Backtesting & analysis:**
-- `choch_databento_replay.py` — backtest against the local Databento file
-- `choch_batch_replay.py` — replay recent days from the TopstepX API
-- `build_daily_summary.py` — build the monthly .xlsx summary workbooks
-
-**Tests:**
-- `test_bracket_orders.py` — full bracket-order lifecycle (mocked broker)
-- `test_limit_orders.py` — limit-order state machine (mocked broker)
-
-## Not in this repo (git-ignored, by design)
-
-- `.env` — your credentials
-- `*.log`, `choch_trades.json` — live logs and trade history
-- `glbx-*.zst` — the Databento market data file (large, licensed; supply your own)
-- backtest output JSON / XLSX — regenerated on demand
-
-## Current strategy configuration
-
-2 ES contracts · RR 7.0 · entry window 6:30-11:00 AM PT · fixed brackets
-(no breakeven move) · 0.25pt minimum stop filter · broker-side stop (type 4) +
-target (type 1) brackets managing every exit.
+- **TopstepX does not permit automated trading from a VPS.** Run it on your own machine.
+- **This bot trades real money.** Backtests run somewhat better than live fills.
+- Not in the repo, by design: `.env`, logs, trade history, market data (`data/`),
+  and backtest outputs (`results/`).
+- Built with Claude as a coding partner: strategy design, debugging, and backtests.

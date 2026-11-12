@@ -54,3 +54,16 @@ Thumbs.db
 .idea/
 .vscode/
 *.swp
+
+# ─── Local-only folders (kept on your computer, never on GitHub) ─────────────
+# data/     raw Databento market data (licensed, large)
+# results/  backtest / replay outputs, trade CSVs, spreadsheets
+# archive/  old notes, handoffs, scratch work
+data/
+results/
+archive/
+Claude outputs/
+scheduled_launch.log
+*.zip
+*.xlsx
+*.old*
