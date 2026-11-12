@@ -48,12 +48,58 @@ SESSION_CLOSE     = time(13, 0)    # PT — force flat / stop building bars
 BREAK_TICKS       = 2        # 2nd HA candle must extend the HA high/low by >= this many ticks
 CONSOL_WINDOW_SEC = 30       # seconds before the 2-min close used to read the entry consolidation
 CLUST             = 0.75     # wick tips within this many points count as one "key level" cluster
-MIN_WICK          = 0.25     # a 1-min candle's wick must be >= this to count toward a cluster
+# A 1-min candle's wick must be >= this to count toward a key-level cluster.
+#
+# TRIED AND REVERTED 2026-08-12. Raising this to 1.0 was an attempt to stabilise the
+# TARGET across data sources. The problem it was aimed at is real: comparing the
+# Databento-tick replay with the TopstepX 1-min replay on 125 exactly-matched trades,
+# ENTRIES agreed 57% and STOPS 63% (median difference 0.00pt) but TARGETS agreed only
+# 36%, with differences up to 18 points; those same trades swung +$1,455 vs -$322.
+#
+# The fix FAILED. At 1.0: tick went +$3,455 -> +$3,259, but TopstepX went
+# -$304 -> -$909, and target agreement moved only 36% -> 39% (max diff 18 -> 23pt).
+# The reasoning was backwards — a HIGHER threshold means FEWER qualifying wicks, so
+# each cluster rests on fewer points and the level becomes MORE sensitive, not less.
+#
+# CONCLUSION: cluster_target is not stabilisable by tuning this constant. Two
+# independent datasets of the same market disagree on where the key levels are, which
+# is why the tick backtest (+$3,259) and the TopstepX backtest (-$909) cannot both be
+# predictive of live behaviour. Do not tune this again without a way to measure
+# level agreement across feeds directly.
+MIN_WICK          = 0.25
 MIN_TP_POINTS     = 2.0      # target must be at least this far from entry (points), else skip
 TP_FRONT_TICKS    = 2        # place TP this many ticks in FRONT of the cluster level
 
 BE_TRIGGER_FRAC   = 0.30     # move stop to breakeven once price travels this fraction toward target
 BE_LOCK_FRAC      = 0.00     # 0.0 = pure breakeven. Set e.g. 0.25 to lock in 25% of target instead.
+
+# Minimum distance the BE trigger may sit from entry, in POINTS. Added 2026-08-12
+# after the live DRY session: two trades with 3.5-4.0pt targets put the 30% trigger
+# only 1.05-1.20pt away — inside normal noise — so breakeven armed within 6-11
+# seconds and both scratched at -$4. A floor stops BE arming on a wiggle while
+# keeping the drawdown protection that makes this survivable.
+#   Tick backtest 6/16-7/21, limit entry, 1-tick-through fills:
+#     floor 0.0 : WR 39.4%  PF 2.60  +$2,836  DD -$185
+#     floor 1.5 : WR 41.9%  PF 2.56  +$2,926  DD -$185   <-- same DD, better net
+#     floor 2.0 : WR 45.5%  PF 2.38  +$2,957  DD -$231
+#     BE OFF    : WR 60.1%  PF 1.62  +$2,599  DD -$499   <-- do NOT do this
+# Removing BE entirely raises the win rate but nearly triples drawdown for no
+# extra profit. The scratches are the cost of the drawdown protection.
+BE_MIN_TRIGGER_PTS = 1.5
+
+# ── VWAP anchor ──────────────────────────────────────────────────────────────
+# WHERE the session VWAP starts accumulating. This is a REAL strategy parameter,
+# not a display setting: the entry filter is "long only above VWAP / short only
+# below", so moving the anchor moves the line and changes which signals pass.
+#   "RTH" — anchor at SESSION_OPEN 6:30 PT. Every validated backtest number
+#           (ES x1 +$36,204 / MES x3 +$9,776, 6/16-8/11) was produced this way.
+#   "CME" — anchor at the 3:00 PM PT CME session open of the PRIOR day, which is
+#           what the TopstepX platform chart displays. VWAP therefore already has
+#           a value at 6:30 instead of building from scratch.
+# Only VWAP accumulation is affected. The Heikin-Ashi chain, the wick-cluster
+# target levels, and the trading window itself stay RTH-only under both settings.
+VWAP_ANCHOR       = "RTH"          # "RTH" | "CME"
+CME_OPEN          = time(15, 0)    # 3:00 PM PT — CME/TopstepX session open
 
 # ── ASIA-SESSION VARIANT (5-minute, volatility-gated) ────────────────────────
 # The RTH edge does NOT transfer to the overnight session as-is — Asia has ~1/3
@@ -185,13 +231,17 @@ def _finish_group(grp, entry, is_long):
 def breakeven_stop(entry, target, is_long):
     """Return the price level at which, once touched, the stop should move to
     breakeven (BE_LOCK_FRAC of the way to target — 0.0 = entry). Returns
-    (trigger_price, new_stop_price)."""
+    (trigger_price, new_stop_price).
+
+    The trigger is BE_TRIGGER_FRAC of the way to target, but never CLOSER than
+    BE_MIN_TRIGGER_PTS — see the note on that constant."""
     dist = abs(target - entry)
+    need = max(BE_TRIGGER_FRAC * dist, BE_MIN_TRIGGER_PTS)
     if is_long:
-        trigger = entry + BE_TRIGGER_FRAC * dist
+        trigger = entry + need
         new_stop = entry + BE_LOCK_FRAC * dist
     else:
-        trigger = entry - BE_TRIGGER_FRAC * dist
+        trigger = entry - need
         new_stop = entry - BE_LOCK_FRAC * dist
     return round(trigger, 2), round(new_stop, 2)
 
@@ -199,3 +249,15 @@ def breakeven_stop(entry, target, is_long):
 def initial_stop(prev_2min_low, prev_2min_high, is_long):
     """One tick beyond the prior 2-min candle's extreme."""
     return round(prev_2min_low - TICK, 2) if is_long else round(prev_2min_high + TICK, 2)
+
+
+# ── REMOVED 2026-08-12: BE-reachability filter ───────────────────────────────
+# A filter was briefly added here that skipped trades where the BE@30 trigger
+# distance exceeded a multiple of the stop distance. It was tuned on 27 tick-
+# days (6/15-7/21) where it looked net positive, but on the full TopstepX
+# window (6/16-8/11) it made things WORSE: 346 trades / $8,974 MES x3 filtered,
+# vs roughly $9.7k unfiltered (Ruth's figure from the prior run; the filtered
+# run is the measured one). That's overfitting to a small sample — the ratio
+# flags trades that are structurally risky, but it does not predict which ones
+# actually lose, and cutting them removes too many eventual winners. Do not
+# re-add without validating on the full window first.
