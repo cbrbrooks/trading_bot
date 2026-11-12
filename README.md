@@ -45,17 +45,19 @@ cp bot/.env.example bot/.env      # then add your TopstepX API key
 The `.env` file lives in `bot/` because the bots and watchdogs read it from
 their own folder. It is git-ignored and never committed.
 
-## Running (from the repo root)
+## Running
+
+Run the live bots from inside `bot/`, so every log and trade file lands there:
 
 ```bash
-python bot/choch_bot_live.py --dry-run     # paper mode: logs decisions, places NO orders
-python bot/intrabar_es_bot.py --dry-run    # tick-level version, paper mode
-python bot/watchdog.py                     # run alongside the bot in a second window
+cd bot
+python choch_bot_live.py --dry-run     # paper mode: logs decisions, places NO orders
+python intrabar_es_bot.py --dry-run    # tick-level version, paper mode
+python watchdog.py                     # run alongside the bot in a second window
 ```
 
-Logs (`choch_bot.log`) and trade history are written into `bot/`.
-
-**Backtests** take a Databento file path or a date range, for example:
+Run backtests and research from the repo root. Backtests take a Databento file
+or a date range:
 
 ```bash
 python backtests/choch_databento_replay.py data/<file>.csv.zst 2026-01-01 2026-06-01
